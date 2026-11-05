@@ -6,7 +6,7 @@ PYTHON ?= $(VENV)/bin/python
 PIP ?= $(VENV)/bin/pip
 PYTEST ?= $(VENV)/bin/pytest
 
-.PHONY: all setup test baseline attack detect headline clean
+.PHONY: all setup test baseline attack detect headline energy-check clean
 
 all: test headline
 
@@ -30,6 +30,9 @@ detect:
 
 headline:
 	PYTHONPATH="src:." "$(PYTHON)" experiments/run_headline_experiment.py
+
+energy-check:
+	PYTHONPATH="src:." "$(PYTHON)" experiments/verify_energy_conservation.py
 
 clean:
 	rm -rf __pycache__ .pytest_cache *.egg-info .coverage
