@@ -1,6 +1,7 @@
 """Skeleton test verifying that all modules exist and import cleanly."""
 
 import importlib
+
 import pytest
 
 MODULE_NAMES = [

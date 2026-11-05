@@ -17,9 +17,12 @@ Implemented Attacks:
 (c) Replay Attack: Replaces real-time telemetry with a recorded buffer of earlier readings.
 """
 
+from collections.abc import Sequence
+from typing import Any
+
 import numpy as np
-from typing import Any, Dict, Optional, Sequence, List
-from ev_sched.hal import MeterInterface, EVSEInterface
+
+from ev_sched.hal import MeterInterface
 
 
 class ConstantBiasMeter(MeterInterface):
@@ -144,7 +147,7 @@ class ReplayAttackMeter(MeterInterface):
         self.duration_min = duration_min
         self.end_min = start_min + duration_min
         self.replay_source_start_min = replay_source_start_min
-        self._buffer: Dict[int, float] = {}
+        self._buffer: dict[int, float] = {}
 
     def is_attack_active(self, t_min: int) -> bool:
         """Return True if cyber-attack is actively replaying telemetry at t_min."""
@@ -208,7 +211,7 @@ class AdaptiveAttackMeter(MeterInterface):
         start_min: int,
         duration_min: int,
         base_forecast_profile_kw: Sequence[float],
-        simulator: Optional[Any] = None,
+        simulator: Any | None = None,
         time_step_min: int = 15,
         noise_std_kw: float = 0.2,
         seed: int = 42,
@@ -251,7 +254,7 @@ class AdaptiveAttackMeter(MeterInterface):
         return reported
 
 
-def create_attacked_meter(inner_meter: MeterInterface, config: Dict[str, Any]) -> MeterInterface:
+def create_attacked_meter(inner_meter: MeterInterface, config: dict[str, Any]) -> MeterInterface:
     """Factory creating an Attacked MeterInterface wrapper from a configuration dictionary.
 
     Parameters

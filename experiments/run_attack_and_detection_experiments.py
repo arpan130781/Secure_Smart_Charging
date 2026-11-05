@@ -13,23 +13,23 @@ Evaluates:
 
 import csv
 from pathlib import Path
-from typing import Dict, List, Tuple
-import yaml
-import numpy as np
-import matplotlib.pyplot as plt
 
+import matplotlib.pyplot as plt
+import numpy as np
+import yaml
+
+from ev_sched.attacks import create_attacked_meter
+from ev_sched.detector import CUSUMDetector, IsolationForestDetector
+from ev_sched.hal import SimEVSE, SimMeter
+from ev_sched.metrics import compute_run_metrics
 from ev_sched.models import EVSession, Feeder, Tariff
+from ev_sched.scheduler import solve_charging_schedule
 from ev_sched.simulator import (
     ChargingStationSimulator,
     generate_synthetic_sessions,
 )
-from ev_sched.hal import SimEVSE, SimMeter
-from ev_sched.scheduler import solve_charging_schedule
-from ev_sched.attacks import create_attacked_meter
-from ev_sched.detector import CUSUMDetector, IsolationForestDetector
-from ev_sched.metrics import compute_run_metrics
-from experiments.run_baseline import generate_diurnal_base_load
 from experiments.compare_baseline_vs_mpc import create_tou_tariff
+from experiments.run_baseline import generate_diurnal_base_load
 
 
 def train_isolation_forest_on_clean_runs(
@@ -41,7 +41,7 @@ def train_isolation_forest_on_clean_runs(
     """Train Isolation Forest on attack-free operational telemetry."""
     print("Training Isolation Forest Detector on attack-free baseline runs...")
     detector = IsolationForestDetector(contamination=0.01, random_state=42)
-    feature_rows: List[np.ndarray] = []
+    feature_rows: list[np.ndarray] = []
 
     for seed in range(500, 500 + num_train_seeds):
         rng = np.random.default_rng(seed)
@@ -56,7 +56,6 @@ def train_isolation_forest_on_clean_runs(
         sessions = generate_synthetic_sessions(config, rng)
         sim = ChargingStationSimulator(feeder, sessions, time_step_min=15, rng=rng)
         meter = SimMeter(sim, noise_std_kw=0.3)
-        evse = SimEVSE(sim)
 
         prev_r = 0.0
         for step in range(96):
@@ -77,7 +76,7 @@ def train_isolation_forest_on_clean_runs(
 
 def run_mpc_with_monitoring(
     feeder: Feeder,
-    sessions: List[EVSession],
+    sessions: list[EVSession],
     tariff: Tariff,
     attack_config: dict | None,
     iso_detector: IsolationForestDetector,
@@ -85,7 +84,7 @@ def run_mpc_with_monitoring(
     time_step_min: int = 15,
     num_steps: int = 96,
     horizon_steps: int = 16,
-) -> Tuple[List[float], List[float], List[bool], List[bool], List[bool]]:
+) -> tuple[list[float], list[float], list[bool], list[bool], list[bool]]:
     """Run MPC loop under optional attack and monitor with both detectors.
 
     Returns
@@ -97,7 +96,6 @@ def run_mpc_with_monitoring(
     - cusum_alarms        : List[bool]
     - iso_alarms          : List[bool]
     """
-    dt_hours = time_step_min / 60.0
     rng = np.random.default_rng(seed)
 
     sim = ChargingStationSimulator(feeder=feeder, sessions=sessions, time_step_min=time_step_min, rng=rng)
@@ -113,11 +111,11 @@ def run_mpc_with_monitoring(
     cusum = CUSUMDetector(threshold=18.0, slack_kw=1.5, instant_threshold_kw=20.0)
     iso_detector.reset()
 
-    true_feeder_kw: List[float] = []
-    reported_kw: List[float] = []
-    attack_mask: List[bool] = []
-    cusum_alarms: List[bool] = []
-    iso_alarms: List[bool] = []
+    true_feeder_kw: list[float] = []
+    reported_kw: list[float] = []
+    attack_mask: list[bool] = []
+    cusum_alarms: list[bool] = []
+    iso_alarms: list[bool] = []
 
     base_profile = list(feeder.base_load_profile_kw)
     price_profile = list(tariff.price_per_kwh_per_15min)
@@ -156,7 +154,7 @@ def run_mpc_with_monitoring(
         rem_tariff = Tariff(price_per_kwh_per_15min=rem_prices)
 
         # Construct shifted sessions
-        active_rem_sessions: List[EVSession] = []
+        active_rem_sessions: list[EVSession] = []
         for s in sessions:
             arr_rel = max(0, s.arrival_min - t_min)
             dep_rel = max(1, s.departure_min - t_min)
@@ -249,17 +247,17 @@ def run_all_experiments(
     }
 
     seeds = [200 + i for i in range(num_seeds)]
-    impact_records: List[dict] = []
+    impact_records: list[dict] = []
 
     # Detection metrics tracking: { (detector, attack): [ (y_true, y_pred, latency) ] }
-    eval_data: Dict[Tuple[str, str], Dict[str, list]] = {
+    eval_data: dict[tuple[str, str], dict[str, list]] = {
         (det, atk): {"y_true": [], "y_pred": [], "latencies": []}
         for det in ["CUSUM", "IsolationForest"]
         for atk in ["constant_bias", "ramp", "replay"]
     }
 
     # Store sample trajectory for plotting (from seed 200)
-    plot_trajectories: Dict[str, List[float]] = {}
+    plot_trajectories: dict[str, list[float]] = {}
 
     print(f"\nSimulating MPC under 4 conditions across {num_seeds} seeds...")
 
@@ -279,7 +277,7 @@ def run_all_experiments(
             rng_ev = np.random.default_rng(seed)
             sessions = generate_synthetic_sessions(config, rng_ev)
 
-            true_load, reported_load, attack_mask, cusum_alerts, iso_alerts = run_mpc_with_monitoring(
+            true_load, _reported_load, attack_mask, cusum_alerts, iso_alerts = run_mpc_with_monitoring(
                 feeder=feeder,
                 sessions=sessions,
                 tariff=tariff,
@@ -347,14 +345,13 @@ def run_all_experiments(
     print(f"Saved Task 11 plot to: {results_dir / 'attack_impact.png'}")
 
     # 5. Compute & Export Task 14: results/detection_metrics.csv
-    detection_rows: List[dict] = []
+    detection_rows: list[dict] = []
     for (det_name, atk_name), data in eval_data.items():
         y_true = np.array(data["y_true"], dtype=int)
         y_pred = np.array(data["y_pred"], dtype=int)
 
         tp = int(np.sum((y_true == 1) & (y_pred == 1)))
         fp = int(np.sum((y_true == 0) & (y_pred == 1)))
-        tn = int(np.sum((y_true == 0) & (y_pred == 0)))
         fn = int(np.sum((y_true == 1) & (y_pred == 0)))
 
         precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 1.0
@@ -409,7 +406,7 @@ def run_all_experiments(
     print("=" * 80)
 
 
-def plot_attack_impact(trajectories: Dict[str, List[float]], limit_kw: float, output_png: Path) -> None:
+def plot_attack_impact(trajectories: dict[str, list[float]], limit_kw: float, output_png: Path) -> None:
     """Generate plain matplotlib plot comparing true feeder load across attack conditions."""
     hours = np.arange(96) * 15.0 / 60.0
 

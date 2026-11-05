@@ -47,13 +47,17 @@ Constraints:
    P_base[t] + sum_{i=0}^{N-1} P[i, t] <= P_feeder_max   for all t in {0, ..., T-1}
 """
 
+import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
+
 import cvxpy as cp
 import numpy as np
 
 from ev_sched.hal import EVSEInterface, MeterInterface
 from ev_sched.models import EVSession, Feeder, Tariff
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -72,6 +76,10 @@ class OptimizationResult:
         Array of slack variables representing unmet energy per session [kWh].
     cost_usd : float
         Calculated electricity cost under the schedule in dollars [$].
+    solver_used : Optional[str], default None
+        Name of the solver that successfully found the solution or was attempted.
+    is_inaccurate : bool, default False
+        True if the solver status was OPTIMAL_INACCURATE.
     """
 
     status: str
@@ -79,16 +87,18 @@ class OptimizationResult:
     power_schedule_kw: np.ndarray
     unmet_energy_kwh: np.ndarray
     cost_usd: float
+    solver_used: str | None = None
+    is_inaccurate: bool = False
 
 
 def solve_charging_schedule(
-    sessions: List[EVSession],
+    sessions: list[EVSession],
     feeder: Feeder,
     tariff: Tariff,
     time_step_min: int = 15,
     num_steps: int = 96,
     unmet_penalty_per_kwh: float = 100.0,
-    solver: Optional[str] = None,
+    solver: str | None = None,
 ) -> OptimizationResult:
     """Solve the multi-vehicle optimal charging schedule using CVXPY.
 
@@ -147,7 +157,7 @@ def solve_charging_schedule(
     P = cp.Variable((num_evs, num_steps), nonneg=True, name="charging_power_kw")
     s = cp.Variable(num_evs, nonneg=True, name="unmet_energy_kwh")
 
-    constraints: List[cp.Constraint] = []
+    constraints: list[cp.Constraint] = []
 
     # 1. Per-EV power saturation and connection windows
     for i, session in enumerate(sessions):
@@ -175,7 +185,7 @@ def solve_charging_schedule(
     # 4. Total feeder load constraint: P_base[t] + sum_i P[i, t] <= transformer_limit_kw
     # Vectorized across all t:
     total_ev_power = cp.sum(P, axis=0)  # shape (num_steps,)
-    available_headroom = np.maximum(0.0, feeder.transformer_limit_kw - base_load_arr)
+    available_headroom = feeder.transformer_limit_kw - base_load_arr
     constraints.append(total_ev_power <= available_headroom)
 
     # Objective: Minimize electricity purchase cost + unmet energy penalty
@@ -187,64 +197,87 @@ def solve_charging_schedule(
     problem = cp.Problem(objective, constraints)
 
     # Solve optimization problem
-    try:
-        # Prefer CLARABEL or OSQP, or fall back to default installed solver
-        solvers_to_try = [solver] if solver else [cp.CLARABEL, cp.OSQP, cp.SCIPY]
-        solved = False
-        last_status = "unsolved"
+    if solver is not None:
+        solvers_to_try = [solver]
+    else:
+        candidates = [cp.CLARABEL, cp.OSQP, cp.SCIPY]
+        solvers_to_try = [s_name for s_name in candidates if s_name in cp.installed_solvers()]
+        if not solvers_to_try:
+            solvers_to_try = cp.installed_solvers()
 
-        for s_name in solvers_to_try:
-            if s_name is None:
-                continue
-            if s_name in cp.installed_solvers():
-                try:
-                    problem.solve(solver=s_name)
-                    last_status = problem.status
-                    if problem.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-                        solved = True
-                        break
-                except Exception:
-                    continue
+    solved = False
+    successful_solver: str | None = None
+    is_inaccurate = False
+    last_status = "unsolved"
+    last_solver: str | None = None
 
-        if not solved:
-            # Fall back to default solver without specifying
-            problem.solve()
-            last_status = problem.status
-            if problem.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
-                solved = True
+    for s_name in solvers_to_try:
+        last_solver = s_name
+        try:
+            problem.solve(solver=s_name)
+            last_status = str(problem.status)
+        except cp.error.SolverError as exc:
+            logger.warning("Solver '%s' failed with SolverError: %s", s_name, exc)
+            last_status = "solver_error"
+            if solver is not None:
+                # If caller passed an explicit solver, never substitute another silently
+                break
+            continue
 
-        if solved and P.value is not None:
-            power_matrix = np.maximum(0.0, np.array(P.value, dtype=float))
-            # Filter numerical solver residual noise below 1e-5 kW (0.01 Watt)
-            power_matrix = np.where(power_matrix < 1e-5, 0.0, power_matrix)
-            unmet_arr = (
-                np.maximum(0.0, np.array(s.value, dtype=float))
-                if s.value is not None
-                else np.zeros(num_evs)
+        if problem.status == cp.OPTIMAL:
+            solved = True
+            successful_solver = s_name
+            is_inaccurate = False
+            break
+        elif problem.status == cp.OPTIMAL_INACCURATE:
+            logger.warning("Solver '%s' returned non-optimal status: %s", s_name, problem.status)
+            solved = True
+            successful_solver = s_name
+            is_inaccurate = True
+            break
+        elif problem.status in [
+            cp.INFEASIBLE,
+            cp.INFEASIBLE_INACCURATE,
+            cp.UNBOUNDED,
+            cp.UNBOUNDED_INACCURATE,
+        ]:
+            logger.warning(
+                "Problem formulation is %s under solver '%s'; stopping solver search.",
+                problem.status,
+                s_name,
             )
-            unmet_arr = np.where(unmet_arr < 1e-5, 0.0, unmet_arr)
-            calculated_cost = float(np.sum(price_arr * dt_hours * np.sum(power_matrix, axis=0)))
-            return OptimizationResult(
-                status=str(problem.status),
-                is_success=True,
-                power_schedule_kw=power_matrix,
-                unmet_energy_kwh=unmet_arr,
-                cost_usd=calculated_cost,
-            )
+            break
         else:
-            # Infeasible or failed: safe fallback
-            return _safe_fallback_result(
-                sessions=sessions,
-                base_load_arr=base_load_arr,
-                transformer_limit_kw=feeder.transformer_limit_kw,
-                price_arr=price_arr,
-                dt_hours=dt_hours,
-                num_steps=num_steps,
-                status=str(last_status),
+            logger.warning(
+                "Solver '%s' returned non-optimal status: %s",
+                s_name,
+                problem.status,
             )
+            if solver is not None:
+                break
 
-    except Exception as exc:
-        # Robust fallback: never crash on solver exception
+    if solved and P.value is not None:
+        power_matrix = np.maximum(0.0, np.array(P.value, dtype=float))
+        # Filter numerical solver residual noise below 1e-5 kW (0.01 Watt)
+        power_matrix = np.where(power_matrix < 1e-5, 0.0, power_matrix)
+        unmet_arr = (
+            np.maximum(0.0, np.array(s.value, dtype=float))
+            if s.value is not None
+            else np.zeros(num_evs)
+        )
+        unmet_arr = np.where(unmet_arr < 1e-5, 0.0, unmet_arr)
+        calculated_cost = float(np.sum(price_arr * dt_hours * np.sum(power_matrix, axis=0)))
+        return OptimizationResult(
+            status=str(problem.status),
+            is_success=True,
+            power_schedule_kw=power_matrix,
+            unmet_energy_kwh=unmet_arr,
+            cost_usd=calculated_cost,
+            solver_used=successful_solver,
+            is_inaccurate=is_inaccurate,
+        )
+    else:
+        # Infeasible, unbounded, or failed: safe fallback
         return _safe_fallback_result(
             sessions=sessions,
             base_load_arr=base_load_arr,
@@ -252,18 +285,22 @@ def solve_charging_schedule(
             price_arr=price_arr,
             dt_hours=dt_hours,
             num_steps=num_steps,
-            status=f"error_{type(exc).__name__}",
+            status=str(last_status),
+            solver_used=last_solver,
+            is_inaccurate=is_inaccurate,
         )
 
 
 def _safe_fallback_result(
-    sessions: List[EVSession],
+    sessions: list[EVSession],
     base_load_arr: np.ndarray,
     transformer_limit_kw: float,
     price_arr: np.ndarray,
     dt_hours: float,
     num_steps: int,
     status: str,
+    solver_used: str | None = None,
+    is_inaccurate: bool = False,
 ) -> OptimizationResult:
     """Generate safe, conservative fallback schedule without violating transformer limit.
 
@@ -280,7 +317,10 @@ def _safe_fallback_result(
         power_schedule_kw=fallback_power,
         unmet_energy_kwh=unmet_energy,
         cost_usd=0.0,
+        solver_used=solver_used,
+        is_inaccurate=is_inaccurate,
     )
+
 
 
 @dataclass
@@ -313,25 +353,31 @@ class MPCSimulationResult:
         Whether detector flagged an alarm at each step.
     safe_mode_active : List[bool]
         Whether controller operated in safe mode at each step.
+    solvers_used : List[Optional[str]]
+        Recorded solver used at each step.
+    inaccurate_statuses : List[bool]
+        Whether solver status was OPTIMAL_INACCURATE at each step.
     """
 
-    step_times_min: List[int]
-    step_times_hours: List[float]
-    measured_feeder_kw: List[float]
-    total_ev_power_kw: List[float]
-    base_load_kw: List[float]
+    step_times_min: list[int]
+    step_times_hours: list[float]
+    measured_feeder_kw: list[float]
+    total_ev_power_kw: list[float]
+    base_load_kw: list[float]
     transformer_limit_kw: float
-    overload_kw: List[float]
-    solver_statuses: List[str]
-    sessions: List[EVSession]
-    true_feeder_kw: List[float] = field(default_factory=list)
-    alarms_raised: List[bool] = field(default_factory=list)
-    safe_mode_active: List[bool] = field(default_factory=list)
+    overload_kw: list[float]
+    solver_statuses: list[str]
+    sessions: list[EVSession]
+    true_feeder_kw: list[float] = field(default_factory=list)
+    alarms_raised: list[bool] = field(default_factory=list)
+    safe_mode_active: list[bool] = field(default_factory=list)
+    solvers_used: list[str | None] = field(default_factory=list)
+    inaccurate_statuses: list[bool] = field(default_factory=list)
 
 
 def run_mpc_charging_loop(
     feeder: Feeder,
-    sessions: List[EVSession],
+    sessions: list[EVSession],
     tariff: Tariff,
     meter: MeterInterface,
     evse: EVSEInterface,
@@ -339,8 +385,8 @@ def run_mpc_charging_loop(
     time_step_min: int = 15,
     num_steps: int = 96,
     unmet_penalty_per_kwh: float = 100.0,
-    horizon_steps: Optional[int] = None,
-    detector: Optional[Any] = None,
+    horizon_steps: int | None = None,
+    detector: Any | None = None,
     conservative_margin_kw: float = 15.0,
     safe_mode_cooldown_steps: int = 4,
     use_telemetry_base_tracking: bool = True,
@@ -394,18 +440,18 @@ def run_mpc_charging_loop(
     MPCSimulationResult
         Trajectory history including true loads, overloads, and cyber telemetry.
     """
-    dt_hours = time_step_min / 60.0
-
-    step_times_min: List[int] = []
-    step_times_hours: List[float] = []
-    measured_feeder_kw: List[float] = []
-    true_feeder_kw: List[float] = []
-    total_ev_power_kw: List[float] = []
-    base_load_kw: List[float] = []
-    overload_kw: List[float] = []
-    solver_statuses: List[str] = []
-    alarms_raised: List[bool] = []
-    safe_mode_active: List[bool] = []
+    step_times_min: list[int] = []
+    step_times_hours: list[float] = []
+    measured_feeder_kw: list[float] = []
+    true_feeder_kw: list[float] = []
+    total_ev_power_kw: list[float] = []
+    base_load_kw: list[float] = []
+    overload_kw: list[float] = []
+    solver_statuses: list[str] = []
+    solvers_used: list[str | None] = []
+    inaccurate_statuses: list[bool] = []
+    alarms_raised: list[bool] = []
+    safe_mode_active: list[bool] = []
 
     # Reset delivered energy on all sessions
     for s in sessions:
@@ -490,7 +536,7 @@ def run_mpc_charging_loop(
         rem_tariff = Tariff(price_per_kwh_per_15min=rem_prices)
 
         # Construct time-shifted sessions relative to current time t_min
-        active_rem_sessions: List[EVSession] = []
+        active_rem_sessions: list[EVSession] = []
         for s in sessions:
             arr_rel = max(0, s.arrival_min - t_min)
             dep_rel = max(1, s.departure_min - t_min)
@@ -520,6 +566,8 @@ def run_mpc_charging_loop(
             unmet_penalty_per_kwh=unmet_penalty_per_kwh,
         )
         solver_statuses.append(opt_res.status)
+        solvers_used.append(opt_res.solver_used)
+        inaccurate_statuses.append(opt_res.is_inaccurate)
 
         # 6. Extract and apply ONLY the first step's setpoints
         step_ev_power = 0.0
@@ -557,4 +605,6 @@ def run_mpc_charging_loop(
         true_feeder_kw=true_feeder_kw,
         alarms_raised=alarms_raised,
         safe_mode_active=safe_mode_active,
+        solvers_used=solvers_used,
+        inaccurate_statuses=inaccurate_statuses,
     )

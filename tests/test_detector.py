@@ -1,7 +1,7 @@
 """Unit tests for detector.py (Task 12, Task 13)."""
 
 import numpy as np
-import pytest
+
 from ev_sched.detector import CUSUMDetector, IsolationForestDetector
 
 

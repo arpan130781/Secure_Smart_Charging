@@ -9,7 +9,7 @@ with standardized abstract interfaces, enabling drop-in physical deployment.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
+from typing import Any
 
 
 class MeterInterface(ABC):

@@ -1,6 +1,7 @@
 """Unit tests for models.py (EVSession, Feeder, Tariff)."""
 
 import pytest
+
 from ev_sched.models import EVSession, Feeder, Tariff
 
 

@@ -8,9 +8,10 @@ Plain matplotlib, no decorative styling, labeled axes with units.
 """
 
 from pathlib import Path
-import yaml
-import numpy as np
+
 import matplotlib.pyplot as plt
+import numpy as np
+import yaml
 
 from ev_sched.models import Feeder
 from ev_sched.simulator import generate_synthetic_sessions, run_uncontrolled_charging

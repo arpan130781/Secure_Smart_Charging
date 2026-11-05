@@ -1,13 +1,14 @@
 """Unit tests for attacks.py (Task 10)."""
 
 import pytest
-from ev_sched.hal import MeterInterface
+
 from ev_sched.attacks import (
     ConstantBiasMeter,
     RampAttackMeter,
     ReplayAttackMeter,
     create_attacked_meter,
 )
+from ev_sched.hal import MeterInterface
 
 
 class MockMeter(MeterInterface):
@@ -101,8 +102,8 @@ def test_create_attacked_meter_factory() -> None:
 
 def test_adaptive_attack_evades_cusum_detector() -> None:
     """Task 17: Verify adaptive attacker evades Detector 1 despite physical overload."""
-    from ev_sched.detector import CUSUMDetector
     from ev_sched.attacks import AdaptiveAttackMeter
+    from ev_sched.detector import CUSUMDetector
 
     # Physical reality: an unmodeled industrial load surge causes true base load
     # to spike to 85 kW. True physical feeder load = 85 kW + 30 kW EV = 115 kW.

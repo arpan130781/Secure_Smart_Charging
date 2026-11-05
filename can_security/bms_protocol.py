@@ -4,9 +4,9 @@ Conforms to standard EV DC fast charging conventions (ISO 15118 / DIN 70121 / SA
 CAN ID 0x101: BMS_Status message transmitted at 100 ms period (10 Hz).
 """
 
-from dataclasses import dataclass
 import struct
-from typing import Optional
+from dataclasses import dataclass
+
 import can
 
 
@@ -54,10 +54,10 @@ def encode_bms_status(
     - Byte 5   : pack_temp_c      (int8,   offset -40 C, range -40 to 87 C)
     - Bytes 6-7: reserved (0x00, 0x00)
     """
-    raw_current = int(round(max(0.0, current_demand_a) / 0.1)) & 0xFFFF
-    raw_voltage = int(round(max(0.0, voltage_limit_v) / 0.1)) & 0xFFFF
-    raw_soc = int(round(max(0.0, min(100.0, soc_percent)) / 0.5)) & 0xFF
-    raw_temp = int(round(pack_temp_c + 40.0)) & 0xFF
+    raw_current = round(max(0.0, current_demand_a) / 0.1) & 0xFFFF
+    raw_voltage = round(max(0.0, voltage_limit_v) / 0.1) & 0xFFFF
+    raw_soc = round(max(0.0, min(100.0, soc_percent)) / 0.5) & 0xFF
+    raw_temp = round(pack_temp_c + 40.0) & 0xFF
 
     payload = struct.pack("<HHBBxx", raw_current, raw_voltage, raw_soc, raw_temp)
     return can.Message(
@@ -68,7 +68,7 @@ def encode_bms_status(
     )
 
 
-def decode_bms_status(msg: can.Message) -> Optional[BMSStatusMessage]:
+def decode_bms_status(msg: can.Message) -> BMSStatusMessage | None:
     """Decode an 8-byte CAN frame into a BMSStatusMessage dataclass."""
     if msg.arbitration_id != CAN_ID_BMS_STATUS or len(msg.data) < 6:
         return None

@@ -12,7 +12,6 @@ Distinction:
 """
 
 from dataclasses import dataclass, field
-from typing import List
 
 
 @dataclass
@@ -89,7 +88,7 @@ class Feeder:
     """
 
     transformer_limit_kw: float
-    base_load_profile_kw: List[float] = field(default_factory=list)
+    base_load_profile_kw: list[float] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.transformer_limit_kw <= 0.0:
@@ -107,4 +106,4 @@ class Tariff:
         kilowatt-hour [$/kWh].
     """
 
-    price_per_kwh_per_15min: List[float] = field(default_factory=list)
+    price_per_kwh_per_15min: list[float] = field(default_factory=list)

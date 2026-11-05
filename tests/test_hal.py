@@ -1,9 +1,10 @@
 """Unit tests for hal.py (MeterInterface, EVSEInterface, SimMeter, SimEVSE)."""
 
 import pytest
+
+from ev_sched.hal import EVSEInterface, MeterInterface, SimEVSE, SimMeter
 from ev_sched.models import EVSession, Feeder
 from ev_sched.simulator import ChargingStationSimulator
-from ev_sched.hal import MeterInterface, EVSEInterface, SimMeter, SimEVSE
 
 
 def test_abstract_interfaces_cannot_be_instantiated() -> None:

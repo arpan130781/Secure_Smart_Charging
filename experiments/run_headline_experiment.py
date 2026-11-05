@@ -13,28 +13,28 @@ Outputs:
 
 import csv
 from pathlib import Path
-from typing import Dict, List, Tuple
-import yaml
-import numpy as np
-import matplotlib.pyplot as plt
 
-from ev_sched.models import EVSession, Feeder, Tariff
+import matplotlib.pyplot as plt
+import numpy as np
+import yaml
+
+from ev_sched.attacks import ConstantBiasMeter
+from ev_sched.detector import CUSUMDetector
+from ev_sched.hal import SimEVSE, SimMeter
+from ev_sched.metrics import (
+    compute_electricity_cost_usd,
+    compute_overload_minutes,
+    compute_peak_load_kw,
+    compute_unmet_energy_kwh,
+)
+from ev_sched.models import EVSession, Feeder
+from ev_sched.scheduler import run_mpc_charging_loop
 from ev_sched.simulator import (
     ChargingStationSimulator,
     generate_synthetic_sessions,
 )
-from ev_sched.hal import SimEVSE, SimMeter
-from ev_sched.attacks import ConstantBiasMeter
-from ev_sched.detector import CUSUMDetector
-from ev_sched.scheduler import run_mpc_charging_loop
-from ev_sched.metrics import (
-    compute_overload_minutes,
-    compute_electricity_cost_usd,
-    compute_unmet_energy_kwh,
-    compute_peak_load_kw,
-)
-from experiments.run_baseline import generate_diurnal_base_load
 from experiments.compare_baseline_vs_mpc import create_tou_tariff
+from experiments.run_baseline import generate_diurnal_base_load
 
 
 def run_headline_simulation(
@@ -42,7 +42,7 @@ def run_headline_simulation(
     seed: int = 42,
     num_steps: int = 96,
     time_step_min: int = 15,
-) -> Tuple[Dict[str, List[float]], Dict[str, Dict[str, float]]]:
+) -> tuple[dict[str, list[float]], dict[str, dict[str, float]]]:
     """Execute the three headline conditions for a reproducible 24-hour run."""
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
@@ -70,8 +70,8 @@ def run_headline_simulation(
     delta_kw = 35.0
 
     conditions = ["normal", "under_attack", "under_attack_with_detection"]
-    time_series_data: Dict[str, List[float]] = {}
-    summary_metrics: Dict[str, Dict[str, float]] = {}
+    time_series_data: dict[str, list[float]] = {}
+    summary_metrics: dict[str, dict[str, float]] = {}
 
     for cond in conditions:
         # Clone fresh sessions with 0 delivered energy
@@ -151,7 +151,7 @@ def run_headline_simulation(
 
 
 def plot_headline_figure(
-    time_series_data: Dict[str, List[float]],
+    time_series_data: dict[str, list[float]],
     transformer_limit_kw: float,
     output_png_path: Path,
     time_step_min: int = 15,
@@ -160,7 +160,7 @@ def plot_headline_figure(
     num_steps = len(time_series_data["normal"])
     hours = np.array([step * time_step_min / 60.0 for step in range(num_steps)])
 
-    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True, sharey=True)
+    _fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True, sharey=True)
 
     # Panel 1: Normal
     ax0 = axes[0]

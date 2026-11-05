@@ -6,11 +6,9 @@ Includes:
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+
 import numpy as np
 from sklearn.ensemble import IsolationForest
-
-from ev_sched.models import Tariff
 
 
 @dataclass(frozen=True)
@@ -169,7 +167,7 @@ class IsolationForestDetector:
         self,
         reported_feeder_kw: float,
         expected_feeder_kw: float,
-        prev_residual_kw: Optional[float] = None,
+        prev_residual_kw: float | None = None,
     ) -> np.ndarray:
         """Construct feature vector for step t."""
         residual = reported_feeder_kw - expected_feeder_kw

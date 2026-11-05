@@ -6,10 +6,10 @@ Performs:
 """
 
 from dataclasses import dataclass
-from typing import Optional
+
 import can
 
-from can_security.bms_protocol import decode_bms_status, CAN_ID_BMS_STATUS
+from can_security.bms_protocol import CAN_ID_BMS_STATUS, decode_bms_status
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,7 @@ class CANAnomalyAlert:
     """
 
     is_alarm: bool
-    alarm_type: Optional[str]
+    alarm_type: str | None
     details: str
 
 
@@ -66,7 +66,7 @@ class CANSecurityDetector:
         self.max_voltage_v = max_voltage_v
         self.max_temp_c = max_temp_c
 
-        self.last_msg_timestamp: Optional[float] = None
+        self.last_msg_timestamp: float | None = None
 
     def reset(self) -> None:
         """Reset internal timing history."""

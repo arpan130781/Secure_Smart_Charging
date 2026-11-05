@@ -1,8 +1,9 @@
 """Unit tests for simulator.py (synthetic session generation & uncontrolled charging)."""
 
+from pathlib import Path
+
 import numpy as np
 import yaml
-from pathlib import Path
 
 from ev_sched.models import EVSession, Feeder
 from ev_sched.simulator import generate_synthetic_sessions, run_uncontrolled_charging

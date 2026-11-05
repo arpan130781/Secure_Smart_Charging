@@ -7,8 +7,9 @@ Includes:
   upon arrival until its requested energy is delivered or it departs.
 """
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any
+
 import numpy as np
 
 from ev_sched.models import EVSession, Feeder
@@ -38,20 +39,20 @@ class SimulationResult:
         Fleet of EV sessions with final ground-truth delivered energies.
     """
 
-    step_times_min: List[int]
-    step_times_hours: List[float]
-    base_load_kw: List[float]
-    ev_load_kw: List[float]
-    total_feeder_load_kw: List[float]
+    step_times_min: list[int]
+    step_times_hours: list[float]
+    base_load_kw: list[float]
+    ev_load_kw: list[float]
+    total_feeder_load_kw: list[float]
     transformer_limit_kw: float
-    overload_kw: List[float]
-    sessions: List[EVSession]
+    overload_kw: list[float]
+    sessions: list[EVSession]
 
 
 def generate_synthetic_sessions(
-    config: Dict[str, Any],
+    config: dict[str, Any],
     rng: np.random.Generator,
-) -> List[EVSession]:
+) -> list[EVSession]:
     """Generate synthetic EV charging sessions according to probabilistic distributions.
 
     Parameters
@@ -94,7 +95,7 @@ def generate_synthetic_sessions(
     if isinstance(rate_opts, (int, float)):
         rate_opts = [float(rate_opts)]
 
-    sessions: List[EVSession] = []
+    sessions: list[EVSession] = []
 
     for i in range(num_evs):
         # 1. Arrival time: Gaussian cluster around morning peak (Poisson arrival intensity)
@@ -137,7 +138,7 @@ def generate_synthetic_sessions(
 
 def run_uncontrolled_charging(
     feeder: Feeder,
-    sessions: List[EVSession],
+    sessions: list[EVSession],
     time_step_min: int = 15,
     num_steps: int = 96,
 ) -> SimulationResult:
@@ -164,12 +165,12 @@ def run_uncontrolled_charging(
     """
     dt_hours = time_step_min / 60.0
 
-    step_times_min: List[int] = []
-    step_times_hours: List[float] = []
-    base_load_kw: List[float] = []
-    ev_load_kw: List[float] = []
-    total_feeder_kw: List[float] = []
-    overload_kw: List[float] = []
+    step_times_min: list[int] = []
+    step_times_hours: list[float] = []
+    base_load_kw: list[float] = []
+    ev_load_kw: list[float] = []
+    total_feeder_kw: list[float] = []
+    overload_kw: list[float] = []
 
     # Reset delivered energy on all sessions
     for s in sessions:
@@ -240,16 +241,16 @@ class ChargingStationSimulator:
     def __init__(
         self,
         feeder: Feeder,
-        sessions: List[EVSession],
+        sessions: list[EVSession],
         time_step_min: int = 15,
-        rng: Optional[np.random.Generator] = None,
+        rng: np.random.Generator | None = None,
     ) -> None:
         self.feeder = feeder
         self.sessions = {s.session_id if s.session_id else f"EV_{i}": s for i, s in enumerate(sessions)}
         self.time_step_min = time_step_min
         self.rng = rng if rng is not None else np.random.default_rng(42)
         self.current_time_min: int = 0
-        self.setpoints_kw: Dict[str, float] = {sid: 0.0 for sid in self.sessions}
+        self.setpoints_kw: dict[str, float] = {sid: 0.0 for sid in self.sessions}
 
     def set_ev_setpoint_kw(self, ev_id: str, power_kw: float) -> None:
         """[SIMULATED] Receive active power command from EVSEInterface."""

@@ -7,9 +7,8 @@ Standard Units:
 - Peak feeder active power: kilowatts [kW]
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Dict, List, Sequence
-import numpy as np
 
 from ev_sched.models import EVSession, Tariff
 
@@ -35,7 +34,7 @@ class RunMetrics:
     unmet_energy_kwh: float
     peak_load_kw: float
 
-    def to_dict(self) -> Dict[str, float]:
+    def to_dict(self) -> dict[str, float]:
         """Convert metrics to a dictionary of rounded floats."""
         return {
             "overload_minutes": round(self.overload_minutes, 1),

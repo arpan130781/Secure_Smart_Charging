@@ -6,16 +6,20 @@ Required checks:
 3. Infeasible cases fall back safely (reduce to minimum rate) instead of crashing.
 """
 
+import logging
+from typing import Any
+
+import cvxpy as cp
 import numpy as np
 import pytest
 
-from ev_sched.models import EVSession, Feeder, Tariff
-from ev_sched.simulator import ChargingStationSimulator
 from ev_sched.hal import SimEVSE, SimMeter
+from ev_sched.models import EVSession, Feeder, Tariff
 from ev_sched.scheduler import (
-    solve_charging_schedule,
     run_mpc_charging_loop,
+    solve_charging_schedule,
 )
+from ev_sched.simulator import ChargingStationSimulator
 
 
 def test_cvxpy_constraints_satisfied_when_feasible() -> None:
@@ -221,4 +225,113 @@ def test_mpc_loop_mitigates_attack_when_detection_enabled() -> None:
 
     # 2. Verify that under safe mode, true physical overload is completely prevented!
     assert np.all(np.array(res_mitigated.overload_kw) == 0.0)
+
+
+def test_monkeypatch_solver_error_falls_back_to_second_solver(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Requirement 6(a): Monkeypatch problem.solve to raise SolverError for first solver and check second is used."""
+    feeder = Feeder(transformer_limit_kw=50.0, base_load_profile_kw=[20.0] * 4)
+    ev = EVSession(arrival_min=0, departure_min=60, energy_req_kwh=5.0, max_rate_kw=11.0, session_id="EV_FALLBACK_TEST")
+    tariff = Tariff(price_per_kwh_per_15min=[0.15] * 4)
+
+    real_solve = cp.Problem.solve
+    solvers_called = []
+
+    def mock_solve(self: cp.Problem, *args: Any, **kwargs: Any) -> Any:
+        current_solver = kwargs.get("solver")
+        solvers_called.append(current_solver)
+        # Fail the first solver called with SolverError
+        if len(solvers_called) == 1:
+            raise cp.error.SolverError(f"Simulated solver crash for {current_solver}")
+        return real_solve(self, *args, **kwargs)
+
+    monkeypatch.setattr(cp.Problem, "solve", mock_solve)
+
+    with caplog.at_level(logging.WARNING):
+        res = solve_charging_schedule(
+            sessions=[ev],
+            feeder=feeder,
+            tariff=tariff,
+            time_step_min=15,
+            num_steps=4,
+        )
+
+    assert res.is_success
+    assert len(solvers_called) >= 2
+    assert res.solver_used is not None
+    assert res.solver_used == solvers_called[1]
+    assert "failed with SolverError" in caplog.text
+
+
+def test_non_solver_exception_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Requirement 6(b): Raise a non-solver exception and check it propagates."""
+    feeder = Feeder(transformer_limit_kw=50.0, base_load_profile_kw=[20.0] * 4)
+    ev = EVSession(arrival_min=0, departure_min=60, energy_req_kwh=5.0, max_rate_kw=11.0, session_id="EV_ERR_PROP")
+    tariff = Tariff(price_per_kwh_per_15min=[0.15] * 4)
+
+    def mock_solve_raise_value_error(self: cp.Problem, *args: Any, **kwargs: Any) -> Any:
+        raise ValueError("Invalid dimension or user parameter error")
+
+    monkeypatch.setattr(cp.Problem, "solve", mock_solve_raise_value_error)
+
+    with pytest.raises(ValueError, match="Invalid dimension or user parameter error"):
+        solve_charging_schedule(
+            sessions=[ev],
+            feeder=feeder,
+            tariff=tariff,
+            time_step_min=15,
+            num_steps=4,
+        )
+
+
+def test_infeasible_problem_checks_fallback_and_logged_status(caplog: pytest.LogCaptureFixture) -> None:
+    """Requirement 6(c): Infeasible case (transformer limit below base load) checks fallback and logged status."""
+    # Transformer limit is 30 kW, but unmanaged base load is 60 kW
+    feeder = Feeder(transformer_limit_kw=30.0, base_load_profile_kw=[60.0] * 4)
+    ev = EVSession(arrival_min=0, departure_min=60, energy_req_kwh=10.0, max_rate_kw=11.0, session_id="EV_INFEAS_LOG")
+    tariff = Tariff(price_per_kwh_per_15min=[0.15] * 4)
+
+    with caplog.at_level(logging.WARNING):
+        res = solve_charging_schedule(
+            sessions=[ev],
+            feeder=feeder,
+            tariff=tariff,
+            time_step_min=15,
+            num_steps=4,
+        )
+
+    # Infeasibility triggers fallback: no power scheduled, unmet energy recorded
+    assert not res.is_success
+    assert "infeasible" in res.status.lower()
+    assert np.all(res.power_schedule_kw == 0.0)
+    assert np.isclose(res.unmet_energy_kwh[0], 10.0, atol=1e-3)
+
+    # Verify that the infeasible non-optimal status was logged using logging
+    assert any("infeasible" in record.message.lower() for record in caplog.records)
+
+
+def test_solver_used_is_recorded_and_explicit_solver_never_substituted() -> None:
+    """Requirement 6(d): Check that solver_used is recorded and explicit solver is never substituted silently."""
+    feeder = Feeder(transformer_limit_kw=50.0, base_load_profile_kw=[20.0] * 4)
+    ev = EVSession(arrival_min=0, departure_min=60, energy_req_kwh=5.0, max_rate_kw=11.0, session_id="EV_SOLVER_REC")
+    tariff = Tariff(price_per_kwh_per_15min=[0.15] * 4)
+
+    # 1. Default solve records solver_used
+    res_default = solve_charging_schedule([ev], feeder, tariff, time_step_min=15, num_steps=4)
+    assert res_default.is_success
+    assert res_default.solver_used is not None
+    assert isinstance(res_default.solver_used, str)
+    assert res_default.is_inaccurate is False
+
+    # 2. Explicit solver passed is recorded and strictly used
+    res_osqp = solve_charging_schedule([ev], feeder, tariff, time_step_min=15, num_steps=4, solver="OSQP")
+    assert res_osqp.is_success
+    assert res_osqp.solver_used == "OSQP"
+
+    # 3. Explicit solver that fails does not substitute another silently
+    res_invalid = solve_charging_schedule([ev], feeder, tariff, time_step_min=15, num_steps=4, solver="NONEXISTENT_SOLVER")
+    assert not res_invalid.is_success
+    assert res_invalid.solver_used == "NONEXISTENT_SOLVER"
+
 

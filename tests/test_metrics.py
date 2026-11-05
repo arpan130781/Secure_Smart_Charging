@@ -1,14 +1,15 @@
 """Unit tests for metrics.py."""
 
 import numpy as np
-from ev_sched.models import EVSession, Tariff
+
 from ev_sched.metrics import (
-    compute_overload_minutes,
     compute_electricity_cost_usd,
-    compute_unmet_energy_kwh,
+    compute_overload_minutes,
     compute_peak_load_kw,
     compute_run_metrics,
+    compute_unmet_energy_kwh,
 )
+from ev_sched.models import EVSession, Tariff
 
 
 def test_metrics_computations() -> None:

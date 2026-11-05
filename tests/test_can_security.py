@@ -7,17 +7,17 @@ Tests:
 4. Python-can virtual bus integration.
 """
 
-import pytest
 import can
+import pytest
+
 from can_security.bms_protocol import (
     CAN_ID_BMS_STATUS,
-    encode_bms_status,
     decode_bms_status,
-    BMSStatusMessage,
+    encode_bms_status,
 )
 from can_security.can_attacks import (
-    inject_value_tampering,
     inject_replay_attack,
+    inject_value_tampering,
 )
 from can_security.can_detector import CANSecurityDetector
 

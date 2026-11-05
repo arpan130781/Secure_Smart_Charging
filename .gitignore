@@ -9,3 +9,4 @@ __pycache__/
 # Keep results/ tracked as requested by rules
 !results/
 !results/**
+audit_logs/

@@ -7,20 +7,20 @@ Outputs:
 
 import csv
 from pathlib import Path
-from typing import List, Tuple
-import yaml
-import numpy as np
-import matplotlib.pyplot as plt
 
-from ev_sched.models import EVSession, Feeder, Tariff
+import matplotlib.pyplot as plt
+import numpy as np
+import yaml
+
+from ev_sched.hal import SimEVSE, SimMeter
+from ev_sched.metrics import compute_run_metrics
+from ev_sched.models import Feeder, Tariff
+from ev_sched.scheduler import run_mpc_charging_loop
 from ev_sched.simulator import (
     ChargingStationSimulator,
     generate_synthetic_sessions,
     run_uncontrolled_charging,
 )
-from ev_sched.hal import SimEVSE, SimMeter
-from ev_sched.scheduler import run_mpc_charging_loop
-from ev_sched.metrics import compute_run_metrics
 from experiments.run_baseline import generate_diurnal_base_load
 
 
@@ -31,7 +31,7 @@ def create_tou_tariff(num_steps: int = 96) -> Tariff:
     - Mid-peak (07:00 - 16:00, 20:00 - 22:00): $0.20 / kWh
     - On-peak  (16:00 - 20:00):                $0.38 / kWh
     """
-    prices: List[float] = []
+    prices: list[float] = []
     for step in range(num_steps):
         hour = (step * 15.0 / 60.0) % 24.0
         if 16.0 <= hour < 20.0:
@@ -60,7 +60,7 @@ def run_comparison_experiment(
     limit_kw = float(config["feeder"]["transformer_limit_kw"])
 
     seeds = [100 + i for i in range(num_seeds)]
-    records: List[dict] = []
+    records: list[dict] = []
 
     print(f"Running comparison over {num_seeds} seeds...")
 
@@ -163,10 +163,9 @@ def run_comparison_experiment(
     print(f"Saved comparison plot to: {png_path}")
 
 
-def plot_comparison(records: List[dict], limit_kw: float, output_png: Path) -> None:
+def plot_comparison(records: list[dict], limit_kw: float, output_png: Path) -> None:
     """Generate plain matplotlib plot comparing uncontrolled vs MPC across 20 seeds."""
     seed_indices = np.arange(len(records)) + 1
-    seeds = [r["seed"] for r in records]
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
 
