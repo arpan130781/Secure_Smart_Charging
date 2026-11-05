@@ -14,6 +14,12 @@ from ev_sched.scheduler import (
     solve_charging_schedule,
     run_mpc_charging_loop,
 )
+from ev_sched.attacks import (
+    ConstantBiasMeter,
+    RampAttackMeter,
+    ReplayAttackMeter,
+    create_attacked_meter,
+)
 from ev_sched.metrics import (
     RunMetrics,
     compute_overload_minutes,
@@ -39,6 +45,10 @@ __all__ = [
     "MPCSimulationResult",
     "solve_charging_schedule",
     "run_mpc_charging_loop",
+    "ConstantBiasMeter",
+    "RampAttackMeter",
+    "ReplayAttackMeter",
+    "create_attacked_meter",
     "RunMetrics",
     "compute_overload_minutes",
     "compute_electricity_cost_usd",
