@@ -211,6 +211,14 @@ When an unmodeled physical load surge increases actual base demand from $45\text
 - **Active Power Simplification:** Feeder limits are modeled strictly via active power ($P$ in kW). In actual distribution feeders with high resistance-to-reactance ratios ($R/X \ge 2$), active power injections create localized voltage drops ($V < 0.95\text{ p.u.}$) and phase unbalance before transformer thermal ampacity is reached. Future extensions require Second-Order Cone Programming (SOCP) for branch power flow.
 - **Submeter Trust Asymmetry:** The framework assumes EVSE internal submeters communicate over authenticated TLS/OCPP links that remain uncompromised. If an adversary compromises the EVSE gateway, the energy balance invariant is defeated.
 
+### 6.3 Cyber-Physical Assumptions: Simulated vs. Real Hardware Realities
+When transitioning from the software simulator to physical hardware deployment (e.g. Raspberry Pi + ATM90E26 + OCPP 1.6J), several foundational simulation assumptions must be accounted for:
+1. **Instantaneous Setpoint Actuation:** The simulation models step setpoint tracking as instantaneous. In reality, on-board chargers (OBC) and battery contactors require 5 to 30 seconds to ramp active power due to PWM pilot negotiation (IEC 61851), DC precharge, and internal current control loop settling.
+2. **Synchronous 15-Minute Periodic Clock:** The simulation operates on an idealized discrete clock ($t = 0, 15, 30, \dots$). In physical deployments, microcontrollers and smart meters experience oscillator clock drift and network jitter ($\pm 1\text{--}10\text{ s}$), requiring asynchronous sample timestamping.
+3. **Lossless Telemetry Links:** Modbus/TCP, DNP3, or cellular backhaul links suffer occasional packet drops ($1\text{--}5\%$) and transmission latencies ($50\text{--}2000\text{ ms}$). The HAL must implement sample-and-hold buffers or NaN-tolerant estimation.
+4. **Charger Efficiency & Power Factor:** The simulator assumes 100% conversion efficiency ($\eta = 1.0$) and unity power factor ($\text{PF} = 1.0$). Physical Level-2 chargers exhibit efficiencies of $88\%\text{--}94\%$ and draw reactive power ($Q$ in kVAR).
+5. **Intra-Step Base Load Invariance:** Non-EV base demand is modeled as piecewise constant over 15-minute intervals. In reality, customer appliances fluctuate continuously within each interval, increasing the variance of the innovation residual $r(t)$.
+
 ---
 
 ## 7. Hardware Deployment Roadmap & CAN Bus Security
