@@ -1,0 +1,29 @@
+# Baseline EV Charging Configuration
+# 24 hours at 15-minute resolution, 20-50 EVs
+
+seed: 42
+num_evs: 30
+
+feeder:
+  transformer_limit_kw: 120.0
+  time_step_minutes: 15
+  num_steps: 96
+  nominal_base_kw: 40.0
+  peak_base_kw: 65.0
+  valley_base_kw: 25.0
+
+arrival:
+  peak_hour: 8.5      # Morning rush hour peak at 08:30 AM (510 minutes)
+  std_hour: 1.5       # Arrival spread of 1.5 hours
+
+duration:
+  mean_log_min: 5.7   # exp(5.7) ~ 300 minutes (5 hours)
+  sigma_log: 0.35
+
+energy:
+  mean_kwh: 28.0      # Average requested energy demand
+  std_kwh: 8.0
+  min_kwh: 12.0
+  max_kwh: 55.0
+
+max_rate_kw: [7.2, 11.0]  # Standard Level-2 EVSE ratings
