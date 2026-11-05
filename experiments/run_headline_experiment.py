@@ -164,6 +164,7 @@ def plot_headline_figure(
 
     # Panel 1: Normal
     ax0 = axes[0]
+    ax0.set_ylim(bottom=0.0)
     ax0.plot(hours, time_series_data["normal"], color="#1f77b4", linewidth=1.8, label="True Feeder Load [kW]")
     ax0.axhline(transformer_limit_kw, color="black", linestyle="--", linewidth=1.2, label=f"Transformer Limit ({transformer_limit_kw:.0f} kW)")
     ax0.set_title("(a) Normal Operation (Clean MPC)", fontsize=11, fontweight="bold")

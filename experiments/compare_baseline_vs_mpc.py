@@ -198,6 +198,7 @@ def plot_comparison(records: list[dict], limit_kw: float, output_png: Path) -> N
     ax1.set_xlabel("Seed Index")
     ax1.set_ylabel("Active Power [kW]")
     ax1.set_xticks(seed_indices)
+    ax1.set_ylim(bottom=0.0)
     ax1.grid(True, linestyle="--", alpha=0.6)
     ax1.legend(loc="upper left")
 
@@ -246,6 +247,7 @@ def plot_comparison(records: list[dict], limit_kw: float, output_png: Path) -> N
     ax3.set_xlabel("Seed Index")
     ax3.set_ylabel("Cost [$]")
     ax3.set_xticks(seed_indices)
+    ax3.set_ylim(bottom=0.0)
     ax3.grid(True, linestyle="--", alpha=0.6)
     ax3.legend(loc="upper left")
 

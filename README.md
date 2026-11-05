@@ -136,38 +136,54 @@ PYTHONPATH=src:. python experiments/run_adaptive_attacker_limitation.py
 
 ## 5. Summary of Empirical Results
 
+All results are reported with statistical spreads ($\text{mean} \pm \text{std}$) and 95% confidence intervals across independent seeded simulation runs.
+
 ### 5.1 Baseline (Uncontrolled) vs. Optimal MPC (20 Seeds)
-Evaluated over 20 random seeds (20–50 EVs per day, NHPP arrival with morning peak, lognormal dwell times, truncated normal energy requests):
+Evaluated over 20 random seeds (Seeds 100 to 119; 20–50 EVs per day, NHPP arrival with morning peak, lognormal dwell times, truncated normal energy requests; generated via `experiments/compare_baseline_vs_mpc.py`):
 
 | Metric | Uncontrolled Baseline | MPC Scheduler (Clean) | Improvement |
 |---|:---:|:---:|:---:|
-| **Peak Feeder Load [kW]** | **217.09 kW** | **119.00 kW** | **-45.2%** (strictly below 120.0 kW limit) |
-| **Overload Duration [min]** | **252.0 min** | **0.0 min** | **-100.0%** (complete overload elimination) |
-| **Total Energy Cost [\$]** | **\$160.72** | **\$157.42** | **-2.1%** (\$3.30/day cost savings) |
-| **Unmet Energy [kWh]** | **36.28 kWh** | **68.64 kWh** | Controlled curtailment to protect transformer |
+| **Peak Feeder Load [kW]** | **$217.09 \pm 24.65\text{ kW}$** | **$119.00 \pm 0.00\text{ kW}$** | **-45.2%** (strictly below 120.0 kW limit) |
+| **Overload Duration [min]** | **$252.00 \pm 26.03\text{ min}$** | **$0.00 \pm 0.00\text{ min}$** | **-100.0%** (complete overload elimination across all seeds) |
+| **Total Energy Cost [\$]** | **$\$160.72 \pm \$6.89$** | **$\$157.42 \pm \$7.12$** | **-2.1%** (\$3.30/day cost savings) |
+| **Unmet Energy [kWh]** | **$36.28 \pm 15.94\text{ kWh}$** | **$68.64 \pm 43.62\text{ kWh}$** | Controlled curtailment to protect transformer |
 
-### 5.2 Cyber Attack Impact on Grid Safety (20 Seeds, 80 Simulations)
-FDI telemetry attack injected between 09:00 and 16:00 (steps 36 to 64):
+*95% Confidence Intervals (20 seeds):*
+- Uncontrolled Peak: $[206.29, 227.89]\text{ kW}$ vs. MPC Peak: $[119.00, 119.00]\text{ kW}$
+- Uncontrolled Overload: $[240.59, 263.41]\text{ min}$ vs. MPC Overload: $[0.00, 0.00]\text{ min}$
+- Uncontrolled Cost: $[\$157.70, \$163.74]$ vs. MPC Cost: $[\$154.30, \$160.54]$
+
+### 5.2 Cyber Attack Impact on Grid Safety (50 Seeds, 200 Simulations)
+Evaluated across 50 independent seeds (Seeds 200 to 249; 200 total MPC simulations; FDI telemetry attack injected between 08:00 and 14:00; generated via `experiments/run_attack_and_detection_experiments.py`):
 
 | Cyber Condition | Peak True Load [kW] | Transformer Overload [min] | Electricity Cost [\$] | Unmet Energy [kWh] |
 |---|:---:|:---:|:---:|:---:|
-| **No Attack (Clean MPC)** | 120.40 kW | 3.0 min | \$158.67 | 68.41 kWh |
-| **Constant Bias ($-35\text{ kW}$)** | **144.61 kW** (+24.2 kW overload!) | **299.2 min** (+296.2 min overload) | \$162.20 | 37.19 kWh |
-| **Ramp Attack ($0 \to -35\text{ kW}$)** | **140.43 kW** (+20.0 kW overload!) | **321.0 min** (+318.0 min overload) | \$160.83 | 44.78 kWh |
-| **Replay Attack (Valley Replay)** | **144.54 kW** (+24.1 kW overload!) | **298.5 min** (+295.5 min overload) | \$162.20 | 37.19 kWh |
+| **No Attack (Clean MPC)** | $120.38 \pm 0.10\text{ kW}$ | $2.70 \pm 5.82\text{ min}$ | $\$156.87 \pm \$10.03$ | $70.56 \pm 36.44\text{ kWh}$ |
+| **Constant Bias ($-35\text{ kW}$)** | **$144.55 \pm 3.36\text{ kW}$** (+24.2 kW) | **$297.00 \pm 36.62\text{ min}$** (+294.3 min) | $\$160.91 \pm \$8.23$ | $37.28 \pm 21.27\text{ kWh}$ |
+| **Ramp Attack ($0 \to -35\text{ kW}$)** | **$140.15 \pm 4.76\text{ kW}$** (+19.8 kW) | **$319.50 \pm 25.58\text{ min}$** (+316.8 min) | $\$159.60 \pm \$8.17$ | $45.18 \pm 24.75\text{ kWh}$ |
+| **Replay Attack (Valley Replay)** | **$144.49 \pm 3.40\text{ kW}$** (+24.1 kW) | **$297.00 \pm 35.47\text{ min}$** (+294.3 min) | $\$160.90 \pm \$8.23$ | $37.28 \pm 21.27\text{ kWh}$ |
 
-### 5.3 Detector Performance (Precision, Recall, FAR, Delay)
+*95% Confidence Intervals (50 seeds):*
+- Constant Bias Overload: $[286.85, 307.15]\text{ min}$
+- Ramp Attack Overload: $[312.41, 326.59]\text{ min}$
+- Replay Attack Overload: $[287.17, 306.83]\text{ min}$
+
+### 5.3 Detector Performance (Precision, Recall, FAR, Delay across 50 Seeds)
+Evaluated across 162.5 clean operational day equivalents:
 
 | Detector | Attack Type | Precision | Recall | False Alarms / Day | Detection Delay [min] |
 |---|---|:---:|:---:|:---:|:---:|
 | **CUSUM (Physics Residual)** | Constant Bias | **1.000** | **1.000** | **0.00** | **0.0 min** |
-| **CUSUM (Physics Residual)** | Ramp Attack | **1.000** | **0.583** | **0.00** | **90.0 min** |
-| **CUSUM (Physics Residual)** | Replay Attack | **1.000** | **0.990** | **0.00** | **1.5 min** |
-| **Isolation Forest (ML)** | Constant Bias | **1.000** | **0.125** | **0.00** | **0.0 min** |
-| **Isolation Forest (ML)** | Ramp Attack | **1.000** | **0.958** | **0.00** | **15.0 min** (Fast $\Delta r$ detection) |
-| **Isolation Forest (ML)** | Replay Attack | **1.000** | **0.942** | **0.00** | **0.0 min** |
+| **CUSUM (Physics Residual)** | Ramp Attack | **1.000** | **0.583\*** | **0.00** | **90.0 min** |
+| **CUSUM (Physics Residual)** | Replay Attack | **1.000** | **0.992** | **0.00** | **1.2 min** |
+| **Isolation Forest (ML)** | Constant Bias | **0.993** | **0.125** | 0.03 | **0.0 min** |
+| **Isolation Forest (ML)** | Ramp Attack | **0.999** | **0.958** | 0.03 | **15.0 min** (Fast $\Delta r$ detection) |
+| **Isolation Forest (ML)** | Replay Attack | **0.999** | **0.947** | 0.03 | **0.0 min** |
+
+*\*Note on Ramp Recall: Step-level classification recall is 58.3% because early ramp steps ($\Delta < 4.3\text{ kW}$) lie within normal sensor noise; however, episode-level detection is 100% across all 50 seeds well before thermal limits are compromised.*
 
 ### 5.4 Headline Mitigation Comparison (`results/headline.csv`)
+*Single representative 24-hour trace (`seed=42`) used for publication time-series figure `results/headline.png`:*
 
 | Operational Condition | Peak True Feeder Load [kW] | Transformer Overload [min] | Total Cost [\$] | Unmet Energy [kWh] |
 |---|:---:|:---:|:---:|:---:|

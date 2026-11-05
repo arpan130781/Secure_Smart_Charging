@@ -431,6 +431,7 @@ def plot_attack_impact(trajectories: dict[str, list[float]], limit_kw: float, ou
     ax.set_xlabel("Time [hours]")
     ax.set_ylabel("True Feeder Load [kW]")
     ax.set_xlim(0.0, 24.0)
+    ax.set_ylim(bottom=0.0)
     ax.grid(True, linestyle="--", alpha=0.6)
     ax.legend(loc="upper left")
 
@@ -441,4 +442,6 @@ def plot_attack_impact(trajectories: dict[str, list[float]], limit_kw: float, ou
 
 
 if __name__ == "__main__":
-    run_all_experiments()
+    import sys
+    n_seeds = int(sys.argv[1]) if len(sys.argv) > 1 else 50
+    run_all_experiments(num_seeds=n_seeds)

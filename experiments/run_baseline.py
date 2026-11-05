@@ -126,6 +126,7 @@ def plot_uncontrolled_baseline(
     ax.set_xlabel("Time [hours]")
     ax.set_ylabel("Active Power [kW]")
     ax.set_xlim(0.0, 24.0)
+    ax.set_ylim(bottom=0.0)
     ax.grid(True, linestyle="--", alpha=0.6)
     ax.legend(loc="upper left")
 
