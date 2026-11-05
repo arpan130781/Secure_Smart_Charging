@@ -18,6 +18,7 @@ from ev_sched.attacks import (
     ConstantBiasMeter,
     RampAttackMeter,
     ReplayAttackMeter,
+    AdaptiveAttackMeter,
     create_attacked_meter,
 )
 from ev_sched.detector import (
@@ -53,6 +54,7 @@ __all__ = [
     "ConstantBiasMeter",
     "RampAttackMeter",
     "ReplayAttackMeter",
+    "AdaptiveAttackMeter",
     "create_attacked_meter",
     "DetectorAlert",
     "CUSUMDetector",

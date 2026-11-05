@@ -172,3 +172,53 @@ def test_receding_horizon_mpc_loop_execution() -> None:
     assert len(mpc_res.solver_statuses) == 8
     # Delivered energy matches target
     assert np.isclose(ev1.delivered_energy_kwh, 10.0, atol=1e-3)
+
+
+def test_mpc_loop_mitigates_attack_when_detection_enabled() -> None:
+    """Task 15: Verify that when detector raises an alarm, safe mode eliminates overload."""
+    from ev_sched.attacks import ConstantBiasMeter
+    from ev_sched.detector import CUSUMDetector
+
+    # Feeder: 50 kW limit, 35 kW base load -> nominal headroom 15 kW
+    feeder = Feeder(transformer_limit_kw=50.0, base_load_profile_kw=[35.0] * 8)
+    ev1 = EVSession(
+        arrival_min=0,
+        departure_min=120,
+        energy_req_kwh=10.0,
+        max_rate_kw=25.0,
+        session_id="EV_ATK_MITIGATION",
+    )
+    tariff = Tariff(price_per_kwh_per_15min=[0.15] * 8)
+
+    sim = ChargingStationSimulator(feeder=feeder, sessions=[ev1], time_step_min=15)
+    base_meter = SimMeter(sim, noise_std_kw=0.0)
+    # Under-reporting attack: subtracts 25 kW between t=30 and t=90 min
+    attacked_meter = ConstantBiasMeter(
+        inner_meter=base_meter,
+        start_min=30,
+        duration_min=60,
+        delta_kw=25.0,
+    )
+    evse = SimEVSE(sim)
+    detector = CUSUMDetector(threshold=18.0, slack_kw=1.5, instant_threshold_kw=20.0)
+
+    res_mitigated = run_mpc_charging_loop(
+        feeder=feeder,
+        sessions=[ev1],
+        tariff=tariff,
+        meter=attacked_meter,
+        evse=evse,
+        simulator=sim,
+        time_step_min=15,
+        num_steps=8,
+        detector=detector,
+        conservative_margin_kw=5.0,
+    )
+
+    # 1. Verify alarm was raised and safe mode was activated
+    assert any(res_mitigated.alarms_raised)
+    assert any(res_mitigated.safe_mode_active)
+
+    # 2. Verify that under safe mode, true physical overload is completely prevented!
+    assert np.all(np.array(res_mitigated.overload_kw) == 0.0)
+

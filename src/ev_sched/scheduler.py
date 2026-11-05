@@ -47,7 +47,7 @@ Constraints:
    P_base[t] + sum_{i=0}^{N-1} P[i, t] <= P_feeder_max   for all t in {0, ..., T-1}
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 import cvxpy as cp
 import numpy as np
@@ -307,6 +307,12 @@ class MPCSimulationResult:
         Recorded solver status at each re-optimization step.
     sessions : List[EVSession]
         EV sessions with final delivered energies.
+    true_feeder_kw : List[float]
+        [SIMULATED] Ground-truth total active power flowing through substation [kW].
+    alarms_raised : List[bool]
+        Whether detector flagged an alarm at each step.
+    safe_mode_active : List[bool]
+        Whether controller operated in safe mode at each step.
     """
 
     step_times_min: List[int]
@@ -318,6 +324,9 @@ class MPCSimulationResult:
     overload_kw: List[float]
     solver_statuses: List[str]
     sessions: List[EVSession]
+    true_feeder_kw: List[float] = field(default_factory=list)
+    alarms_raised: List[bool] = field(default_factory=list)
+    safe_mode_active: List[bool] = field(default_factory=list)
 
 
 def run_mpc_charging_loop(
@@ -331,14 +340,22 @@ def run_mpc_charging_loop(
     num_steps: int = 96,
     unmet_penalty_per_kwh: float = 100.0,
     horizon_steps: Optional[int] = None,
+    detector: Optional[Any] = None,
+    conservative_margin_kw: float = 15.0,
+    safe_mode_cooldown_steps: int = 4,
+    use_telemetry_base_tracking: bool = True,
 ) -> MPCSimulationResult:
-    """Execute receding-horizon MPC EV charging simulation.
+    """Execute receding-horizon MPC EV charging simulation with optional cyber detector.
 
     At each discrete 15-minute time step:
     1. Reads the feeder meter through MeterInterface.
-    2. Re-solves the constrained CVXPY optimization over the remaining horizon.
-    3. Dispatches only the first step's optimal power setpoints via EVSEInterface.
-    4. Advances physical simulation state by one time step.
+    2. Runs bad-data detector on energy balance: expected = base_forecast + sum(ev_cmd).
+    3. If alarm raised, switches to safe mode:
+       - Discards corrupted meter reading, restoring trustworthy base forecast.
+       - Caps setpoints conservatively by reducing available transformer headroom.
+    4. Re-solves the constrained CVXPY optimization over the remaining horizon.
+    5. Dispatches only the first step's optimal power setpoints via EVSEInterface.
+    6. Advances physical simulation state by one time step.
 
     Parameters
     ----------
@@ -363,21 +380,32 @@ def run_mpc_charging_loop(
     horizon_steps : Optional[int]
         Maximum lookahead planning horizon in steps. If None, plans over all
         remaining steps until the end of the 24-hour day.
+    detector : Optional[Any], default None
+        Cyber anomaly detector (e.g., CUSUMDetector or IsolationForestDetector).
+    conservative_margin_kw : float, default 15.0
+        Capacity derating margin applied to transformer limit in safe mode [kW].
+    safe_mode_cooldown_steps : int, default 4
+        Number of steps controller remains in safe mode after alarm [15-min steps].
+    use_telemetry_base_tracking : bool, default True
+        Whether controller infers base load drift from meter telemetry when unalarmed.
 
     Returns
     -------
     MPCSimulationResult
-        Trajectory history including feeder loads, overloads, and solver statuses.
+        Trajectory history including true loads, overloads, and cyber telemetry.
     """
     dt_hours = time_step_min / 60.0
 
     step_times_min: List[int] = []
     step_times_hours: List[float] = []
     measured_feeder_kw: List[float] = []
+    true_feeder_kw: List[float] = []
     total_ev_power_kw: List[float] = []
     base_load_kw: List[float] = []
     overload_kw: List[float] = []
     solver_statuses: List[str] = []
+    alarms_raised: List[bool] = []
+    safe_mode_active: List[bool] = []
 
     # Reset delivered energy on all sessions
     for s in sessions:
@@ -393,6 +421,8 @@ def run_mpc_charging_loop(
         pad_p = price_profile[-1] if price_profile else 0.15
         price_profile.extend([pad_p] * (num_steps - len(price_profile)))
 
+    safe_mode_timer: int = 0
+
     for step in range(num_steps):
         t_min = step * time_step_min
         step_times_min.append(t_min)
@@ -405,14 +435,55 @@ def run_mpc_charging_loop(
         curr_base_kw = base_profile[step]
         base_load_kw.append(curr_base_kw)
 
-        # 2. Determine remaining horizon for re-solving
+        # 2. Inspect active EV charging power and evaluate bad-data detector
+        current_ev_measured_kw = (
+            float(simulator.get_total_ev_power_kw())
+            if hasattr(simulator, "get_total_ev_power_kw")
+            else sum(evse.read_session_kw(s.session_id) for s in sessions)
+        )
+        expected_feeder_kw = curr_base_kw + current_ev_measured_kw
+
+        alarm_now = False
+        if detector is not None:
+            alert = detector.update(reported_feeder_kw=meas_kw, expected_feeder_kw=expected_feeder_kw)
+            alarm_now = bool(alert.is_alarm)
+        alarms_raised.append(alarm_now)
+
+        if alarm_now:
+            safe_mode_timer = safe_mode_cooldown_steps
+
+        is_safe_mode = bool(safe_mode_timer > 0)
+        if safe_mode_timer > 0:
+            safe_mode_timer -= 1
+        safe_mode_active.append(is_safe_mode)
+
+        # 3. Compute telemetry offset and effective transformer rating
+        if use_telemetry_base_tracking and not is_safe_mode:
+            inferred_current_base = max(0.0, meas_kw - current_ev_measured_kw)
+            telemetry_offset_kw = inferred_current_base - curr_base_kw
+        else:
+            # Under safe mode: discard corrupted meter reading, restore expected base load
+            telemetry_offset_kw = 0.0
+
+        if is_safe_mode:
+            # Safe mode: cap setpoints more conservatively by reserving safety margin
+            effective_transformer_limit_kw = max(
+                0.0, feeder.transformer_limit_kw - conservative_margin_kw
+            )
+        else:
+            effective_transformer_limit_kw = feeder.transformer_limit_kw
+
+        # 4. Determine remaining horizon for re-solving
         rem_steps = num_steps - step
         plan_steps = rem_steps if horizon_steps is None else min(horizon_steps, rem_steps)
 
         # Prepare remaining profiles
-        rem_base = base_profile[step : step + plan_steps]
+        rem_base = [
+            max(0.0, b + telemetry_offset_kw)
+            for b in base_profile[step : step + plan_steps]
+        ]
         rem_feeder = Feeder(
-            transformer_limit_kw=feeder.transformer_limit_kw,
+            transformer_limit_kw=effective_transformer_limit_kw,
             base_load_profile_kw=rem_base,
         )
         rem_prices = price_profile[step : step + plan_steps]
@@ -421,11 +492,9 @@ def run_mpc_charging_loop(
         # Construct time-shifted sessions relative to current time t_min
         active_rem_sessions: List[EVSession] = []
         for s in sessions:
-            # Shift arrival and departure relative to current time step
             arr_rel = max(0, s.arrival_min - t_min)
             dep_rel = max(1, s.departure_min - t_min)
 
-            # Check if vehicle has arrived and not yet departed
             if s.is_connected(t_min) or (s.arrival_min >= t_min and s.arrival_min < t_min + plan_steps * time_step_min):
                 rem_energy = s.remaining_energy_req_kwh
             else:
@@ -441,7 +510,7 @@ def run_mpc_charging_loop(
             )
             active_rem_sessions.append(shifted_s)
 
-        # 3. Solve CVXPY schedule over the remaining horizon
+        # 5. Solve CVXPY schedule over the remaining horizon
         opt_res = solve_charging_schedule(
             sessions=active_rem_sessions,
             feeder=rem_feeder,
@@ -452,7 +521,7 @@ def run_mpc_charging_loop(
         )
         solver_statuses.append(opt_res.status)
 
-        # 4. Extract and apply ONLY the first step's setpoints
+        # 6. Extract and apply ONLY the first step's setpoints
         step_ev_power = 0.0
         for i, s in enumerate(sessions):
             if opt_res.is_success and i < opt_res.power_schedule_kw.shape[0]:
@@ -468,10 +537,11 @@ def run_mpc_charging_loop(
 
         total_ev_power_kw.append(step_ev_power)
         actual_total_feeder = curr_base_kw + step_ev_power
+        true_feeder_kw.append(actual_total_feeder)
         overload = max(0.0, actual_total_feeder - feeder.transformer_limit_kw)
         overload_kw.append(overload)
 
-        # 5. Advance simulator by one time step
+        # 7. Advance simulator by one time step
         simulator.step()
 
     return MPCSimulationResult(
@@ -484,4 +554,7 @@ def run_mpc_charging_loop(
         overload_kw=overload_kw,
         solver_statuses=solver_statuses,
         sessions=sessions,
+        true_feeder_kw=true_feeder_kw,
+        alarms_raised=alarms_raised,
+        safe_mode_active=safe_mode_active,
     )

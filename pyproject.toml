@@ -14,7 +14,8 @@ dependencies = [
     "cvxpy>=1.4.0",
     "scikit-learn>=1.5.0",
     "matplotlib>=3.9.0",
-    "pyyaml>=6.0"
+    "pyyaml>=6.0",
+    "python-can>=4.3.0"
 ]
 
 [project.optional-dependencies]

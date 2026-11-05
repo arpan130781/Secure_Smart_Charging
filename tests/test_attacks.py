@@ -86,3 +86,61 @@ def test_create_attacked_meter_factory() -> None:
 
     m_replay = create_attacked_meter(inner, {"attack_type": "replay", "start_min": 10, "duration_min": 20, "replay_source_start_min": 0})
     assert isinstance(m_replay, ReplayAttackMeter)
+
+    m_adapt = create_attacked_meter(
+        inner,
+        {
+            "attack_type": "adaptive",
+            "start_min": 10,
+            "duration_min": 20,
+            "base_forecast_profile_kw": [40.0] * 10,
+        },
+    )
+    assert hasattr(m_adapt, "is_attack_active")
+
+
+def test_adaptive_attack_evades_cusum_detector() -> None:
+    """Task 17: Verify adaptive attacker evades Detector 1 despite physical overload."""
+    from ev_sched.detector import CUSUMDetector
+    from ev_sched.attacks import AdaptiveAttackMeter
+
+    # Physical reality: an unmodeled industrial load surge causes true base load
+    # to spike to 85 kW. True physical feeder load = 85 kW + 30 kW EV = 115 kW.
+    # Feeder limit is 100 kW -> True overload = 15 kW!
+    inner_meter = MockMeter({100: 115.0, 115: 115.0, 130: 115.0})
+
+    # The EMS model holds a base forecast of 50.0 kW.
+    # With 30.0 kW EV load, expected feeder load = 80.0 kW.
+    base_forecast = [50.0] * 20
+
+    class MockSimulator:
+        def get_total_ev_power_kw(self) -> float:
+            return 30.0
+
+    sim = MockSimulator()
+    adaptive_meter = AdaptiveAttackMeter(
+        inner_meter=inner_meter,
+        start_min=100,
+        duration_min=45,
+        base_forecast_profile_kw=base_forecast,
+        simulator=sim,
+        noise_std_kw=0.1,
+        seed=42,
+    )
+
+    detector = CUSUMDetector(threshold=18.0, slack_kw=1.5, instant_threshold_kw=20.0)
+
+    # During attack (t = 100, 115, 130 min)
+    for t_min in [100, 115, 130]:
+        reported_kw = adaptive_meter.read_feeder_kw(t_min)
+        expected_kw = 50.0 + 30.0  # 80.0 kW
+        alert = detector.update(reported_feeder_kw=reported_kw, expected_feeder_kw=expected_kw)
+
+        # Residual stays within small noise (|r| < 1.0 kW << 18.0 kW threshold)
+        assert abs(alert.residual_kw) < 1.0
+        # CUSUM is completely blind: NO ALARM raised!
+        assert not alert.is_alarm
+
+        # Yet physical meter reading is 115.0 kW (severe overload!)
+        assert inner_meter.read_feeder_kw(t_min) == 115.0
+

@@ -17,8 +17,9 @@ Implemented Attacks:
 (c) Replay Attack: Replaces real-time telemetry with a recorded buffer of earlier readings.
 """
 
-from typing import Any, Dict, Optional
-from ev_sched.hal import MeterInterface
+import numpy as np
+from typing import Any, Dict, Optional, Sequence, List
+from ev_sched.hal import MeterInterface, EVSEInterface
 
 
 class ConstantBiasMeter(MeterInterface):
@@ -164,6 +165,92 @@ class ReplayAttackMeter(MeterInterface):
         return true_kw
 
 
+class AdaptiveAttackMeter(MeterInterface):
+    """Wraps MeterInterface with an adaptive, model-cognizant FDI attack.
+
+    The attacker knows that the Energy Management System (EMS) monitors the
+    energy-balance innovation residual:
+        r(t) = reported_kw(t) - (P_base_forecast_kw[t] + sum(P_ev_cmd))
+
+    To remain undetectable to Detector 1 (residual check / CUSUM), the adaptive
+    attacker clamps the reported telemetry to the expected balance plus small noise:
+        reported_kw(t) = P_base_forecast_kw[t] + ev_power_kw(t) + noise
+    
+    When an unmodeled load surge occurs physically (e.g. true base load increases
+    by delta_surge_kw), the true transformer load exceeds capacity:
+        P_true(t) = P_base_forecast_kw[t] + delta_surge_kw + sum(P_ev) > P_feeder_max
+    Yet the residual remains zero-mean noise r(t) ~ N(0, sigma^2). Detector 1
+    observes zero anomaly, resulting in zero alarms and undetected physical overload.
+
+    Parameters
+    ----------
+    inner_meter : MeterInterface
+        The physical or simulated meter being wrapped.
+    start_min : int
+        Simulation elapsed time when attack begins in minutes [minutes].
+    duration_min : int
+        Duration of the attack window in minutes [minutes].
+    base_forecast_profile_kw : Sequence[float]
+        EMS base load forecast known to the adaptive attacker in kilowatts [kW].
+    simulator : Optional[Any], default None
+        Simulator reference to observe active EV power (or EVSE interface).
+    time_step_min : int, default 15
+        Time step resolution in minutes [minutes].
+    noise_std_kw : float, default 0.2
+        Residual noise standard deviation injected to mimic legitimate telemetry [kW].
+    seed : int, default 42
+        Random seed for reproducible noise generation.
+    """
+
+    def __init__(
+        self,
+        inner_meter: MeterInterface,
+        start_min: int,
+        duration_min: int,
+        base_forecast_profile_kw: Sequence[float],
+        simulator: Optional[Any] = None,
+        time_step_min: int = 15,
+        noise_std_kw: float = 0.2,
+        seed: int = 42,
+    ) -> None:
+        self.inner_meter = inner_meter
+        self.start_min = start_min
+        self.duration_min = duration_min
+        self.end_min = start_min + duration_min
+        self.base_forecast_profile_kw = list(base_forecast_profile_kw)
+        self.simulator = simulator
+        self.time_step_min = time_step_min
+        self.noise_std_kw = noise_std_kw
+        self.rng = np.random.default_rng(seed)
+
+    def is_attack_active(self, t_min: int) -> bool:
+        """Return True if cyber-attack is actively injecting false data at t_min."""
+        return self.start_min <= t_min < self.end_min
+
+    def read_feeder_kw(self, t_min: int) -> float:
+        """[MEASURED] Return adaptive feeder reading in kilowatts [kW]."""
+        true_kw = self.inner_meter.read_feeder_kw(t_min)
+        if not self.is_attack_active(t_min):
+            return true_kw
+
+        step = t_min // self.time_step_min
+        forecast_base = (
+            self.base_forecast_profile_kw[step]
+            if step < len(self.base_forecast_profile_kw)
+            else self.base_forecast_profile_kw[-1]
+        )
+
+        # Inspect current active EV power from simulator if available
+        ev_kw = 0.0
+        if self.simulator is not None and hasattr(self.simulator, "get_total_ev_power_kw"):
+            ev_kw = float(self.simulator.get_total_ev_power_kw())
+
+        # Synthesize reported reading perfectly matching expected balance + noise
+        noise = float(self.rng.normal(0.0, self.noise_std_kw))
+        reported = max(0.0, forecast_base + ev_kw + noise)
+        return reported
+
+
 def create_attacked_meter(inner_meter: MeterInterface, config: Dict[str, Any]) -> MeterInterface:
     """Factory creating an Attacked MeterInterface wrapper from a configuration dictionary.
 
@@ -173,11 +260,13 @@ def create_attacked_meter(inner_meter: MeterInterface, config: Dict[str, Any]) -
         Legitimate meter to wrap.
     config : Dict[str, Any]
         Configuration dictionary containing:
-        - attack_type: 'constant_bias', 'ramp', or 'replay'
+        - attack_type: 'constant_bias', 'ramp', 'replay', or 'adaptive'
         - start_min: start time in elapsed minutes [minutes]
         - duration_min: duration in minutes [minutes]
         - magnitude_kw: bias magnitude in kilowatts [kW] (for bias and ramp)
         - replay_source_start_min: historical window start in minutes (for replay)
+        - base_forecast_profile_kw: forecast profile for adaptive attack
+        - simulator: simulator reference for adaptive attack
 
     Returns
     -------
@@ -210,6 +299,16 @@ def create_attacked_meter(inner_meter: MeterInterface, config: Dict[str, Any]) -
             start_min=start_min,
             duration_min=duration_min,
             replay_source_start_min=replay_source,
+        )
+    elif atk_type == "adaptive":
+        base_forecast = config.get("base_forecast_profile_kw", [30.0] * 96)
+        sim = config.get("simulator", None)
+        return AdaptiveAttackMeter(
+            inner_meter=inner_meter,
+            start_min=start_min,
+            duration_min=duration_min,
+            base_forecast_profile_kw=base_forecast,
+            simulator=sim,
         )
     else:
         raise ValueError(f"Unknown attack type: {atk_type}")

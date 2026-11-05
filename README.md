@@ -232,6 +232,13 @@ Simulates 80 MPC runs across 20 seeds and outputs:
 - `results/attack_impact.png`
 - `results/detection_metrics.csv`
 
+### 5. Reproduce Headline Mitigation & Adaptive Attacker Limitation (Tasks 15–17)
+```bash
+PYTHONPATH=src:. python experiments/run_headline_experiment.py
+PYTHONPATH=src:. python experiments/run_adaptive_attacker_limitation.py
+```
+Outputs `results/headline.png` and `results/headline.csv`.
+
 ---
 
 ## 7. Assumptions & Engineering Decisions
@@ -240,3 +247,30 @@ Simulates 80 MPC runs across 20 seeds and outputs:
 2. **Submeter Asymmetry:** Individual EVSE charging posts are located on-premises and communicate over authenticated TLS/OCPP links with local metering chips, whereas substation feeder meters communicate over utility WAN/SCADA links susceptible to man-in-the-middle FDI tampering.
 3. **CUSUM Parameter Selection:** The slack parameter $\nu = 1.5\text{ kW}$ exceeds $3\sigma$ of measurement noise to guarantee negative drift under $H_0$. The threshold $h = 18.0\text{ kW}$ was tuned using Average Run Length theory to ensure zero false alarms during normal operations.
 4. **Isolation Forest Features:** Providing the first difference $\Delta r(t) = r(t) - r(t-1)$ alongside $r(t)$ enables the tree partitioner to isolate ramping anomalies 5x faster than cumulative residual sums.
+
+---
+
+## 8. Limitations & Adaptive Attacker Analysis (Task 17)
+
+While Detector 1 (CUSUM on energy-balance residual $r(t)$) effectively detects uncoordinated false data injection attacks (constant bias, ramps, and replays), it exhibits a fundamental theoretical limitation against **model-cognizant adaptive attackers**:
+
+### Mathematical Vulnerability
+The residual is defined as:
+$$r(t) = y_{\text{reported}}(t) - \left(P_{\text{base}}^{\text{forecast}}(t) + \sum_{i} P_i^{\text{cmd}}(t)\right)$$
+
+If an attacker learns or reverse-engineers the Energy Management System's internal base load forecast profile $P_{\text{base}}^{\text{forecast}}(t)$ and monitors dispatched setpoints $\sum P_i(t)$, they can synthesize telemetry that dynamically satisfies the expected balance:
+$$y_{\text{reported}}(t) = P_{\text{base}}^{\text{forecast}}(t) + \sum_{i} P_i^{\text{cmd}}(t) + \mathcal{N}(0, \sigma^2)$$
+
+### Empirical Verification (`experiments/run_adaptive_attacker_limitation.py`)
+In our empirical evaluation, when an unmodeled physical load surge increases actual base demand from $45\text{ kW}$ to $75\text{ kW}$ (under an $80\text{ kW}$ transformer limit):
+- **True Physical Feeder Load:** Climbs to **$90.0\text{ kW}$** (**$+10.0\text{ kW}$ overload**) for **120.0 minutes**.
+- **Reported Feeder Telemetry:** Artificially held at $60.0\text{ kW}$.
+- **Innovation Residual:** $\mathbb{E}[r(t)] \approx 0.0\text{ kW}$ (indistinguishable from sensor noise).
+- **Detector 1 Performance:** **0 alarms raised (100% missed detection rate)**.
+
+### Honest Academic Assessment
+This vulnerability illustrates the classic cyber-physical limitation identified in power systems literature (Liu et al., 2011; Pasqualetti et al., 2013): **state estimation residuals only protect against attacks with components lying in the observable subspace orthogonal to the system model**. An adversary with knowledge of the invariant can mask physical grid stress by falsifying telemetry within the invariant null-space. Mitigating adaptive attacks requires:
+1. Multi-modal sensor verification (e.g. transformer top-oil thermal sensors, ambient temperature, or bus voltage sensitivities),
+2. Dynamic watermarking of EV charging commands, or
+3. Cryptographically authenticated telemetry down to the smart meter ASIC.
+
