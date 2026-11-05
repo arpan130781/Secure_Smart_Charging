@@ -220,3 +220,84 @@ def run_uncontrolled_charging(
         overload_kw=overload_kw,
         sessions=sessions,
     )
+
+
+class ChargingStationSimulator:
+    """Stateful cyber-physical simulator wrapped by SimMeter and SimEVSE.
+
+    Parameters
+    ----------
+    feeder : Feeder
+        Feeder specifications (transformer capacity, base load profile).
+    sessions : List[EVSession]
+        List of EV charging sessions.
+    time_step_min : int, default 15
+        Simulation time-step resolution in minutes [minutes].
+    rng : Optional[np.random.Generator]
+        Seeded pseudo-random number generator for measurement noise.
+    """
+
+    def __init__(
+        self,
+        feeder: Feeder,
+        sessions: List[EVSession],
+        time_step_min: int = 15,
+        rng: Optional[np.random.Generator] = None,
+    ) -> None:
+        self.feeder = feeder
+        self.sessions = {s.session_id if s.session_id else f"EV_{i}": s for i, s in enumerate(sessions)}
+        self.time_step_min = time_step_min
+        self.rng = rng if rng is not None else np.random.default_rng(42)
+        self.current_time_min: int = 0
+        self.setpoints_kw: Dict[str, float] = {sid: 0.0 for sid in self.sessions}
+
+    def set_ev_setpoint_kw(self, ev_id: str, power_kw: float) -> None:
+        """[SIMULATED] Receive active power command from EVSEInterface."""
+        if ev_id in self.sessions:
+            self.setpoints_kw[ev_id] = max(0.0, float(power_kw))
+
+    def get_session_power_kw(self, ev_id: str) -> float:
+        """[SIMULATED & MEASURED] Get current physical charging power delivered to session."""
+        if ev_id not in self.sessions:
+            return 0.0
+        session = self.sessions[ev_id]
+        if not session.is_connected(self.current_time_min):
+            return 0.0
+        if session.remaining_energy_req_kwh <= 1e-4:
+            return 0.0
+
+        cmd_kw = self.setpoints_kw.get(ev_id, 0.0)
+        dt_hours = self.time_step_min / 60.0
+        max_energy_kw = session.remaining_energy_req_kwh / dt_hours
+        return float(min(cmd_kw, session.max_rate_kw, max_energy_kw))
+
+    def get_total_ev_power_kw(self) -> float:
+        """[SIMULATED] Calculate sum of active power across all charging sessions."""
+        return sum(self.get_session_power_kw(sid) for sid in self.sessions)
+
+    def get_base_load_kw(self, t_min: int) -> float:
+        """[SIMULATED] Lookup background non-EV grid load at elapsed time t_min."""
+        step_idx = t_min // self.time_step_min
+        profile = self.feeder.base_load_profile_kw
+        if not profile:
+            return 30.0
+        if step_idx < len(profile):
+            return float(profile[step_idx])
+        return float(profile[-1])
+
+    def get_feeder_power_kw(self, t_min: int) -> float:
+        """[SIMULATED] Compute total feeder active power (base load + aggregate EV load)."""
+        base_kw = self.get_base_load_kw(t_min)
+        ev_kw = self.get_total_ev_power_kw()
+        return base_kw + ev_kw
+
+    def step(self) -> None:
+        """[SIMULATED] Integrate physical battery energies and advance time by one interval."""
+        dt_hours = self.time_step_min / 60.0
+        for sid, session in self.sessions.items():
+            power_kw = self.get_session_power_kw(sid)
+            if power_kw > 0.0:
+                energy_added = power_kw * dt_hours
+                session.delivered_energy_kwh += energy_added
+
+        self.current_time_min += self.time_step_min
