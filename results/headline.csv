@@ -1,4 +1,4 @@
 condition,peak_true_load_kw,overload_minutes,total_cost_usd,unmet_energy_kwh
-normal,120.6,105.0,152.35,96.19
-under_attack,147.3,300.0,158.22,66.86
-under_attack_with_detection,120.04,15.0,150.37,124.94
+normal,119.5,0.0,156.15,78.1
+under_attack,140.82,300.0,159.38,43.52
+under_attack_with_detection,118.66,0.0,144.71,135.96

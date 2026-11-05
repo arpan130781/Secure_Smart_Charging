@@ -8,7 +8,7 @@ from ev_sched.attacks import (
     ReplayAttackMeter,
     create_attacked_meter,
 )
-from ev_sched.hal import MeterInterface
+from ev_sched.hal import EVSEInterface, MeterInterface
 
 
 class MockMeter(MeterInterface):
@@ -136,7 +136,6 @@ def test_adaptive_attack_evades_cusum_detector() -> None:
         reported_kw = adaptive_meter.read_feeder_kw(t_min)
         expected_kw = 50.0 + 30.0  # 80.0 kW
         alert = detector.update(reported_feeder_kw=reported_kw, expected_feeder_kw=expected_kw)
-
         # Residual stays within small noise (|r| < 1.0 kW << 18.0 kW threshold)
         assert abs(alert.residual_kw) < 1.0
         # CUSUM is completely blind: NO ALARM raised!
@@ -144,4 +143,26 @@ def test_adaptive_attack_evades_cusum_detector() -> None:
 
         # Yet physical meter reading is 115.0 kW (severe overload!)
         assert inner_meter.read_feeder_kw(t_min) == 115.0
+
+    # Test HAL EVSE interface integration
+    class MockEVSE(EVSEInterface):
+        def set_setpoint_kw(self, ev_id: str, power_kw: float) -> None:
+            pass
+
+        def read_session_kw(self, ev_id: str) -> float:
+            return 15.0
+
+    evse = MockEVSE()
+    adaptive_meter_evse = AdaptiveAttackMeter(
+        inner_meter=inner_meter,
+        start_min=100,
+        duration_min=45,
+        base_forecast_profile_kw=base_forecast,
+        evse=evse,
+        session_ids=["EV_1", "EV_2"],
+        noise_std_kw=0.0,
+        seed=42,
+    )
+    # 50 kW base + 2 * 15 kW EV = 80 kW
+    assert adaptive_meter_evse.read_feeder_kw(100) == 80.0
 

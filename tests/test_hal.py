@@ -50,3 +50,20 @@ def test_sim_meter_and_sim_evse_interaction() -> None:
     # Step simulator (15 min = 0.25 h -> 11 kW * 0.25 h = 2.75 kWh delivered)
     sim.step()
     assert s1.delivered_energy_kwh == 2.75
+
+
+def test_sim_meter_idempotency_and_rng_isolation() -> None:
+    feeder = Feeder(transformer_limit_kw=100.0, base_load_profile_kw=[35.0] * 4)
+    sim = ChargingStationSimulator(feeder=feeder, sessions=[], time_step_min=15)
+    meter = SimMeter(sim, noise_std_kw=0.5, seed=100)
+
+    # 1. Idempotency: reading the same timestamp multiple times returns identical values
+    val1 = meter.read_feeder_kw(t_min=0)
+    val2 = meter.read_feeder_kw(t_min=0)
+    assert val1 == val2
+
+    # 2. Simulator RNG state is not perturbed by meter reads
+    sim_rng_state_before = sim.rng.bit_generator.state
+    _ = meter.read_feeder_kw(t_min=15)
+    sim_rng_state_after = sim.rng.bit_generator.state
+    assert sim_rng_state_before == sim_rng_state_after

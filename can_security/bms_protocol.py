@@ -8,6 +8,7 @@ import struct
 from dataclasses import dataclass
 
 import can
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -54,10 +55,10 @@ def encode_bms_status(
     - Byte 5   : pack_temp_c      (int8,   offset -40 C, range -40 to 87 C)
     - Bytes 6-7: reserved (0x00, 0x00)
     """
-    raw_current = round(max(0.0, current_demand_a) / 0.1) & 0xFFFF
-    raw_voltage = round(max(0.0, voltage_limit_v) / 0.1) & 0xFFFF
-    raw_soc = round(max(0.0, min(100.0, soc_percent)) / 0.5) & 0xFF
-    raw_temp = round(pack_temp_c + 40.0) & 0xFF
+    raw_current = int(np.clip(round(max(0.0, current_demand_a) / 0.1), 0, 0xFFFF))
+    raw_voltage = int(np.clip(round(max(0.0, voltage_limit_v) / 0.1), 0, 0xFFFF))
+    raw_soc = int(np.clip(round(max(0.0, min(100.0, soc_percent)) / 0.5), 0, 0xFF))
+    raw_temp = int(np.clip(round(pack_temp_c + 40.0), 0, 0xFF))
 
     payload = struct.pack("<HHBBxx", raw_current, raw_voltage, raw_soc, raw_temp)
     return can.Message(

@@ -22,7 +22,7 @@ from typing import Any
 
 import numpy as np
 
-from ev_sched.hal import MeterInterface
+from ev_sched.hal import EVSEInterface, MeterInterface
 
 
 class ConstantBiasMeter(MeterInterface):
@@ -195,8 +195,12 @@ class AdaptiveAttackMeter(MeterInterface):
         Duration of the attack window in minutes [minutes].
     base_forecast_profile_kw : Sequence[float]
         EMS base load forecast known to the adaptive attacker in kilowatts [kW].
+    evse : Optional[EVSEInterface], default None
+        HAL interface to observe active EV submetered power.
+    session_ids : Optional[Sequence[str]], default None
+        List of session identifiers to query across EVSEInterface.
     simulator : Optional[Any], default None
-        Simulator reference to observe active EV power (or EVSE interface).
+        Fallback simulator reference.
     time_step_min : int, default 15
         Time step resolution in minutes [minutes].
     noise_std_kw : float, default 0.2
@@ -211,6 +215,8 @@ class AdaptiveAttackMeter(MeterInterface):
         start_min: int,
         duration_min: int,
         base_forecast_profile_kw: Sequence[float],
+        evse: EVSEInterface | None = None,
+        session_ids: Sequence[str] | None = None,
         simulator: Any | None = None,
         time_step_min: int = 15,
         noise_std_kw: float = 0.2,
@@ -221,6 +227,8 @@ class AdaptiveAttackMeter(MeterInterface):
         self.duration_min = duration_min
         self.end_min = start_min + duration_min
         self.base_forecast_profile_kw = list(base_forecast_profile_kw)
+        self.evse = evse
+        self.session_ids = list(session_ids) if session_ids is not None else None
         self.simulator = simulator
         self.time_step_min = time_step_min
         self.noise_std_kw = noise_std_kw
@@ -243,9 +251,11 @@ class AdaptiveAttackMeter(MeterInterface):
             else self.base_forecast_profile_kw[-1]
         )
 
-        # Inspect current active EV power from simulator if available
+        # Inspect current active EV power strictly via EVSEInterface when available
         ev_kw = 0.0
-        if self.simulator is not None and hasattr(self.simulator, "get_total_ev_power_kw"):
+        if self.evse is not None and self.session_ids is not None:
+            ev_kw = sum(self.evse.read_session_kw(sid) for sid in self.session_ids)
+        elif self.simulator is not None and hasattr(self.simulator, "get_total_ev_power_kw"):
             ev_kw = float(self.simulator.get_total_ev_power_kw())
 
         # Synthesize reported reading perfectly matching expected balance + noise
@@ -305,12 +315,16 @@ def create_attacked_meter(inner_meter: MeterInterface, config: dict[str, Any]) -
         )
     elif atk_type == "adaptive":
         base_forecast = config.get("base_forecast_profile_kw", [30.0] * 96)
+        evse = config.get("evse", None)
+        session_ids = config.get("session_ids", None)
         sim = config.get("simulator", None)
         return AdaptiveAttackMeter(
             inner_meter=inner_meter,
             start_min=start_min,
             duration_min=duration_min,
             base_forecast_profile_kw=base_forecast,
+            evse=evse,
+            session_ids=session_ids,
             simulator=sim,
         )
     else:

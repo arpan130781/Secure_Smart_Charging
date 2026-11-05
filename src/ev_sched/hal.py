@@ -11,6 +11,8 @@ with standardized abstract interfaces, enabling drop-in physical deployment.
 from abc import ABC, abstractmethod
 from typing import Any
 
+import numpy as np
+
 
 class MeterInterface(ABC):
     """Abstract interface for reading feeder / substation power meters."""
@@ -75,17 +77,39 @@ class SimMeter(MeterInterface):
         Underlying grid and EV simulation instance.
     noise_std_kw : float, default 0.0
         Standard deviation of Gaussian sensor measurement noise in kilowatts [kW].
+    rng : Optional[np.random.Generator], default None
+        Dedicated pseudo-random number generator for sensor noise.
+    seed : int, default 42
+        Seed used to initialize dedicated sensor RNG if none is provided.
     """
 
-    def __init__(self, simulator: Any, noise_std_kw: float = 0.0) -> None:
+    def __init__(
+        self,
+        simulator: Any,
+        noise_std_kw: float = 0.0,
+        rng: np.random.Generator | None = None,
+        seed: int = 42,
+    ) -> None:
         self._sim = simulator
         self.noise_std_kw = noise_std_kw
+        self.rng = rng if rng is not None else np.random.default_rng(seed)
+        self._noise_cache: dict[int, float] = {}
+
+    def reset(self) -> None:
+        """Clear cached sensor noise realizations."""
+        self._noise_cache.clear()
 
     def read_feeder_kw(self, t_min: int) -> float:
-        """[MEASURED] Return measured active feeder power from simulator."""
+        """[MEASURED] Return measured active feeder power from simulator.
+
+        Measurement noise is cached per timestamp t_min to ensure idempotency
+        and avoid perturbing random streams during multiple telemetry queries.
+        """
         raw_kw = self._sim.get_feeder_power_kw(t_min)
-        if self.noise_std_kw > 0.0 and hasattr(self._sim, "rng"):
-            noise = float(self._sim.rng.normal(0.0, self.noise_std_kw))
+        if self.noise_std_kw > 0.0:
+            if t_min not in self._noise_cache:
+                self._noise_cache[t_min] = float(self.rng.normal(0.0, self.noise_std_kw))
+            noise = self._noise_cache[t_min]
             return max(0.0, raw_kw + noise)
         return float(raw_kw)
 

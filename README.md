@@ -10,12 +10,16 @@ Designed for an academic interview with a university professor working on EV cha
 
 In modern distribution networks, clusters of Electric Vehicle Supply Equipment (EVSE) are coordinated by a central Energy Management System (EMS). To avoid overloading distribution transformers and thermal cable ratings, the EMS uses **Model Predictive Control (MPC)** to schedule charging within available capacity:
 
-$$\sum_{i \in \text{EVs}} P_i(t) \le P_{\text{feeder}}^{\max} - \hat{P}_{\text{base}}(t)$$
+$$\sum_{i \in \text{EVs}} P_i(t) \le P_{\text{feeder}}^{\max} - \hat{P}_{\text{base}}(t) - P_{\text{margin}}$$
 
 where:
 - $P_{\text{feeder}}^{\max}$: Transformer continuous thermal capacity rating [kW] (e.g. 120.0 kW).
 - $\hat{P}_{\text{base}}(t)$: Unmanaged background grid load (residential/commercial demand) [kW].
 - $P_i(t)$: Commanded active charging power dispatched to EV $i$ [kW].
+- $P_{\text{margin}}$: Nominal headroom buffer reserved against sensor noise [kW] (e.g. 1.0 kW $\approx 3.3\sigma$ for $\sigma = 0.3\text{ kW}$).
+
+### Synthetic Session Generation (Inhomogeneous Poisson Process)
+Fleet arrival times are modeled via a Non-Homogeneous Poisson Process (NHPP) conditioned on total fleet size $N$, drawing arrival slots via multinomial sampling from a normalized diurnal intensity profile $f(t) = \lambda(t) / \int \lambda(u)\,du$ with a morning commuting peak centered at 08:30 ($\mu = 510\text{ min}$, $\sigma = 75\text{ min}$). Dwell durations follow a lognormal distribution, and energy requests follow a truncated normal distribution bounded by battery capacity.
 
 ### The Cyber Vulnerability (FDI on Feeder Telemetry)
 Substation feeder meters communicate with the EMS over SCADA or AMI telemetry links (e.g. Modbus/TCP, DNP3, or cellular backhaul). Because these legacy links often lack end-to-end cryptographic integrity or authentication, an adversary can intercept and manipulate the telemetry:
@@ -133,46 +137,43 @@ PYTHONPATH=src:. python experiments/run_adaptive_attacker_limitation.py
 ## 5. Summary of Empirical Results
 
 ### 5.1 Baseline (Uncontrolled) vs. Optimal MPC (20 Seeds)
-Evaluated over 20 random seeds (20–50 EVs per day, Poisson arrival with morning peak, lognormal dwell times, truncated normal energy requests):
+Evaluated over 20 random seeds (20–50 EVs per day, NHPP arrival with morning peak, lognormal dwell times, truncated normal energy requests):
 
 | Metric | Uncontrolled Baseline | MPC Scheduler (Clean) | Improvement |
 |---|:---:|:---:|:---:|
-| **Peak Feeder Load [kW]** | **172.93 kW** | **120.62 kW** | **-30.2%** (safely constrained to 120.0 kW limit) |
-| **Overload Duration [min]** | **233.2 min** | **140.2 min\*** | **-39.9%** |
-| **Overload Energy [kWh]** | **78.41 kWh** | **0.86 kWh** | **-98.9%** (eliminated transformer stress) |
-| **Total Energy Cost [\$]** | **\$179.31** | **\$149.47** | **-16.6%** (\$29.84/day cost savings) |
-| **Unmet Energy [kWh]** | **0.00 kWh** | **100.42 kWh** | Managed tradeoff during high-load peaks |
-
-*\*Clean MPC peak load of 120.62 kW is within the nominal $\pm 0.9\text{ kW}$ ($3\sigma$) sensor noise band.*
+| **Peak Feeder Load [kW]** | **217.09 kW** | **119.00 kW** | **-45.2%** (strictly below 120.0 kW limit) |
+| **Overload Duration [min]** | **252.0 min** | **0.0 min** | **-100.0%** (complete overload elimination) |
+| **Total Energy Cost [\$]** | **\$160.72** | **\$157.42** | **-2.1%** (\$3.30/day cost savings) |
+| **Unmet Energy [kWh]** | **36.28 kWh** | **68.64 kWh** | Controlled curtailment to protect transformer |
 
 ### 5.2 Cyber Attack Impact on Grid Safety (20 Seeds, 80 Simulations)
 FDI telemetry attack injected between 09:00 and 16:00 (steps 36 to 64):
 
 | Cyber Condition | Peak True Load [kW] | Transformer Overload [min] | Electricity Cost [\$] | Unmet Energy [kWh] |
 |---|:---:|:---:|:---:|:---:|
-| **No Attack (Clean MPC)** | 120.62 kW | 140.2 min | \$149.47 | 100.42 kWh |
-| **Constant Bias ($-35\text{ kW}$)** | **147.70 kW** (+27.7 kW overload!) | **291.8 min** (+151.6 min overload) | \$157.95 | 55.45 kWh |
-| **Ramp Attack ($0 \to -35\text{ kW}$)** | **139.08 kW** (+19.1 kW overload!) | **312.0 min** (+171.8 min overload) | \$154.44 | 73.15 kWh |
-| **Replay Attack (Valley Replay)** | **147.70 kW** (+27.7 kW overload!) | **291.8 min** (+151.6 min overload) | \$157.95 | 55.45 kWh |
+| **No Attack (Clean MPC)** | 120.40 kW | 3.0 min | \$158.67 | 68.41 kWh |
+| **Constant Bias ($-35\text{ kW}$)** | **144.61 kW** (+24.2 kW overload!) | **299.2 min** (+296.2 min overload) | \$162.20 | 37.19 kWh |
+| **Ramp Attack ($0 \to -35\text{ kW}$)** | **140.43 kW** (+20.0 kW overload!) | **321.0 min** (+318.0 min overload) | \$160.83 | 44.78 kWh |
+| **Replay Attack (Valley Replay)** | **144.54 kW** (+24.1 kW overload!) | **298.5 min** (+295.5 min overload) | \$162.20 | 37.19 kWh |
 
 ### 5.3 Detector Performance (Precision, Recall, FAR, Delay)
 
 | Detector | Attack Type | Precision | Recall | False Alarms / Day | Detection Delay [min] |
 |---|---|:---:|:---:|:---:|:---:|
 | **CUSUM (Physics Residual)** | Constant Bias | **1.000** | **1.000** | **0.00** | **0.0 min** |
-| **CUSUM (Physics Residual)** | Ramp Attack | **1.000** | **0.590** | **0.00** | **90.0 min** |
-| **CUSUM (Physics Residual)** | Replay Attack | **1.000** | **0.973** | **0.00** | **0.8 min** |
-| **Isolation Forest (ML)** | Constant Bias | **0.990** | **1.000** | 0.33 | **0.0 min** |
-| **Isolation Forest (ML)** | Ramp Attack | **0.989** | **0.950** | 0.33 | **18.0 min** (Fast $\Delta r$ detection) |
-| **Isolation Forest (ML)** | Replay Attack | **0.990** | **1.000** | 0.33 | **0.0 min** |
+| **CUSUM (Physics Residual)** | Ramp Attack | **1.000** | **0.583** | **0.00** | **90.0 min** |
+| **CUSUM (Physics Residual)** | Replay Attack | **1.000** | **0.990** | **0.00** | **1.5 min** |
+| **Isolation Forest (ML)** | Constant Bias | **1.000** | **0.125** | **0.00** | **0.0 min** |
+| **Isolation Forest (ML)** | Ramp Attack | **1.000** | **0.958** | **0.00** | **15.0 min** (Fast $\Delta r$ detection) |
+| **Isolation Forest (ML)** | Replay Attack | **1.000** | **0.942** | **0.00** | **0.0 min** |
 
 ### 5.4 Headline Mitigation Comparison (`results/headline.csv`)
 
 | Operational Condition | Peak True Feeder Load [kW] | Transformer Overload [min] | Total Cost [\$] | Unmet Energy [kWh] |
 |---|:---:|:---:|:---:|:---:|
-| **Normal Operation (Clean MPC)** | 120.60 kW | 105.0 min | \$152.35 | 96.19 kWh |
-| **Under Attack (Unmitigated)** | **147.30 kW** (+27.3 kW) | **300.0 min** (+195.0 min) | \$158.22 | 66.86 kWh |
-| **Under Attack with Detection (Mitigated)** | **120.04 kW** (-27.3 kW) | **15.0 min** (-285.0 min) | \$150.37 | 124.94 kWh |
+| **Normal Operation (Clean MPC)** | 119.50 kW | 0.0 min | \$156.15 | 78.10 kWh |
+| **Under Attack (Unmitigated)** | **140.82 kW** (+21.3 kW) | **300.0 min** (+300.0 min) | \$159.38 | 43.52 kWh |
+| **Under Attack with Detection (Mitigated)** | **118.66 kW** (-22.2 kW) | **0.0 min** (-300.0 min) | \$144.71 | 135.96 kWh |
 
 ---
 

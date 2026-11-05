@@ -97,13 +97,23 @@ def generate_synthetic_sessions(
 
     sessions: list[EVSession] = []
 
+    # 1. Non-Homogeneous Poisson Arrival Process (NHPP) with morning peak:
+    # Under classical Poisson point process theory, conditioned on N arrivals over [0, T],
+    # arrival times are distributed as independent random draws from the normalized
+    # intensity density f(t) = lambda(t) / int_0^T lambda(u) du.
+    # Intensity lambda(t) models morning commuter arrivals centered at peak_min with spread std_min.
+    time_slots_min = np.arange(0, 1440, 15)
+    # Bounded operational arrival window between 06:00 (360 min) and 20:00 (1200 min)
+    valid_window_mask = (time_slots_min >= 360) & (time_slots_min <= 1200)
+    gaussian_intensity = np.exp(-0.5 * ((time_slots_min - peak_min) / max(1.0, std_min)) ** 2)
+    poisson_intensity = np.where(valid_window_mask, gaussian_intensity, 0.0)
+    intensity_sum = np.sum(poisson_intensity)
+    arrival_probs = poisson_intensity / intensity_sum if intensity_sum > 0 else np.ones(96) / 96.0
+
+    chosen_slots = rng.choice(len(time_slots_min), size=num_evs, p=arrival_probs)
+
     for i in range(num_evs):
-        # 1. Arrival time: Gaussian cluster around morning peak (Poisson arrival intensity)
-        # Bounded between 06:00 (360 min) and 20:00 (1200 min)
-        raw_arr = rng.normal(loc=peak_min, scale=std_min)
-        arr_min = int(np.clip(round(raw_arr), 360, 1200))
-        # Quantize to 15-minute grid alignment
-        arr_min = (arr_min // 15) * 15
+        arr_min = int(time_slots_min[chosen_slots[i]])
 
         # 2. Parking duration: Lognormal distribution
         raw_dur = rng.lognormal(mean=mean_log, sigma=sigma_log)

@@ -335,3 +335,46 @@ def test_solver_used_is_recorded_and_explicit_solver_never_substituted() -> None
     assert res_invalid.solver_used == "NONEXISTENT_SOLVER"
 
 
+def test_mpc_loop_updates_delivered_energy_via_evse_feedback_without_simulator() -> None:
+    """Finding 1 verification: Controller tracks battery delivered energy from EVSE telemetry without simulator."""
+    from ev_sched.hal import EVSEInterface, MeterInterface
+
+    class HardwareOCPPEVSE(EVSEInterface):
+        def __init__(self) -> None:
+            self.dispatched: dict[str, float] = {}
+
+        def set_setpoint_kw(self, ev_id: str, power_kw: float) -> None:
+            self.dispatched[ev_id] = power_kw
+
+        def read_session_kw(self, ev_id: str) -> float:
+            return self.dispatched.get(ev_id, 0.0)
+
+    class HardwareModbusMeter(MeterInterface):
+        def read_feeder_kw(self, t_min: int) -> float:
+            return 30.0
+
+    feeder = Feeder(transformer_limit_kw=60.0, base_load_profile_kw=[20.0] * 4)
+    ev = EVSession(arrival_min=0, departure_min=60, energy_req_kwh=10.0, max_rate_kw=10.0, session_id="EV_HW_TEST")
+    tariff = Tariff(price_per_kwh_per_15min=[0.1] * 4)
+
+    evse = HardwareOCPPEVSE()
+    meter = HardwareModbusMeter()
+
+    # Pass simulator=None to guarantee logic does not depend on simulator.step()
+    res = run_mpc_charging_loop(
+        feeder=feeder,
+        sessions=[ev],
+        tariff=tariff,
+        meter=meter,
+        evse=evse,
+        simulator=None,
+        time_step_min=15,
+        num_steps=4,
+    )
+
+    # In each 15-min step (0.25 h), ev charges at ~10 kW -> 2.5 kWh per step -> 10 kWh total
+    assert ev.delivered_energy_kwh > 0.0
+    assert np.isclose(ev.delivered_energy_kwh, 10.0, atol=1e-2)
+    assert np.isclose(sum(res.total_ev_power_kw) * 0.25, 10.0, atol=1e-2)
+
+

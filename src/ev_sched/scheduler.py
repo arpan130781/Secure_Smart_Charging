@@ -177,7 +177,18 @@ def solve_charging_schedule(
         # 2. Energy requested delivered by departure (soft constraint)
         req_energy = session.remaining_energy_req_kwh
         energy_delivered = cp.sum(P[i, arr_step:dep_step]) * dt_hours
-        constraints.append(energy_delivered + s[i] >= req_energy)
+
+        # When the vehicle's dwell extends beyond the receding horizon (departure_min > num_steps * time_step_min),
+        # prorate the horizon target energy by the fraction of dwell within this horizon to prevent
+        # artificial peak charging and false unmet penalties.
+        full_dwell_steps = max(1, int(np.ceil(session.departure_min / time_step_min)) - arr_step)
+        dwell_horizon_steps = dep_step - arr_step
+        if session.departure_min > num_steps * time_step_min:
+            target_energy = min(req_energy, req_energy * (dwell_horizon_steps / full_dwell_steps))
+        else:
+            target_energy = req_energy
+
+        constraints.append(energy_delivered + s[i] >= target_energy)
 
         # 3. Do not overcharge beyond requested energy
         constraints.append(energy_delivered <= req_energy)
@@ -381,12 +392,13 @@ def run_mpc_charging_loop(
     tariff: Tariff,
     meter: MeterInterface,
     evse: EVSEInterface,
-    simulator: Any,
+    simulator: Any | None = None,
     time_step_min: int = 15,
     num_steps: int = 96,
     unmet_penalty_per_kwh: float = 100.0,
     horizon_steps: int | None = None,
     detector: Any | None = None,
+    nominal_margin_kw: float = 1.0,
     conservative_margin_kw: float = 15.0,
     safe_mode_cooldown_steps: int = 4,
     use_telemetry_base_tracking: bool = True,
@@ -415,7 +427,7 @@ def run_mpc_charging_loop(
         HAL interface providing feeder power telemetry.
     evse : EVSEInterface
         HAL interface for dispatching EV charging setpoints.
-    simulator : Any
+    simulator : Optional[Any], default None
         Physical simulator to step forward.
     time_step_min : int, default 15
         Step duration in minutes [minutes].
@@ -428,6 +440,8 @@ def run_mpc_charging_loop(
         remaining steps until the end of the 24-hour day.
     detector : Optional[Any], default None
         Cyber anomaly detector (e.g., CUSUMDetector or IsolationForestDetector).
+    nominal_margin_kw : float, default 1.0
+        Capacity derating margin applied to transformer limit in nominal mode to reject sensor noise [kW].
     conservative_margin_kw : float, default 15.0
         Capacity derating margin applied to transformer limit in safe mode [kW].
     safe_mode_cooldown_steps : int, default 4
@@ -482,11 +496,8 @@ def run_mpc_charging_loop(
         base_load_kw.append(curr_base_kw)
 
         # 2. Inspect active EV charging power and evaluate bad-data detector
-        current_ev_measured_kw = (
-            float(simulator.get_total_ev_power_kw())
-            if hasattr(simulator, "get_total_ev_power_kw")
-            else sum(evse.read_session_kw(s.session_id) for s in sessions)
-        )
+        # Strictly queries EVSEInterface, preserving Hardware Abstraction Layer
+        current_ev_measured_kw = sum(evse.read_session_kw(s.session_id) for s in sessions)
         expected_feeder_kw = curr_base_kw + current_ev_measured_kw
 
         alarm_now = False
@@ -517,7 +528,9 @@ def run_mpc_charging_loop(
                 0.0, feeder.transformer_limit_kw - conservative_margin_kw
             )
         else:
-            effective_transformer_limit_kw = feeder.transformer_limit_kw
+            effective_transformer_limit_kw = max(
+                0.0, feeder.transformer_limit_kw - nominal_margin_kw
+            )
 
         # 4. Determine remaining horizon for re-solving
         rem_steps = num_steps - step
@@ -570,7 +583,10 @@ def run_mpc_charging_loop(
         inaccurate_statuses.append(opt_res.is_inaccurate)
 
         # 6. Extract and apply ONLY the first step's setpoints
+        dt_hours = time_step_min / 60.0
         step_ev_power = 0.0
+        prev_energies: list[float] = [s.delivered_energy_kwh for s in sessions]
+
         for i, s in enumerate(sessions):
             if opt_res.is_success and i < opt_res.power_schedule_kw.shape[0]:
                 cmd_kw = float(opt_res.power_schedule_kw[i, 0])
@@ -584,13 +600,27 @@ def run_mpc_charging_loop(
             step_ev_power += actual_kw
 
         total_ev_power_kw.append(step_ev_power)
-        actual_total_feeder = curr_base_kw + step_ev_power
+
+        # Ground truth power flow: read from physical simulator when present
+        if simulator is not None and hasattr(simulator, "get_feeder_power_kw"):
+            actual_total_feeder = float(simulator.get_feeder_power_kw(t_min))
+        else:
+            actual_total_feeder = curr_base_kw + step_ev_power
+
         true_feeder_kw.append(actual_total_feeder)
         overload = max(0.0, actual_total_feeder - feeder.transformer_limit_kw)
         overload_kw.append(overload)
 
-        # 7. Advance simulator by one time step
-        simulator.step()
+        # 7. Advance simulator by one time step if present
+        if simulator is not None and hasattr(simulator, "step"):
+            simulator.step()
+
+        # Feedback state estimation: update delivered energy from measured EVSE submetering
+        # if not already mutated by physical simulator
+        for i, s in enumerate(sessions):
+            if np.isclose(s.delivered_energy_kwh, prev_energies[i]):
+                actual_s_kw = evse.read_session_kw(s.session_id)
+                s.delivered_energy_kwh += actual_s_kw * dt_hours
 
     return MPCSimulationResult(
         step_times_min=step_times_min,

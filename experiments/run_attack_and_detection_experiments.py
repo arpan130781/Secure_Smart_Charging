@@ -56,12 +56,13 @@ def train_isolation_forest_on_clean_runs(
         sessions = generate_synthetic_sessions(config, rng)
         sim = ChargingStationSimulator(feeder, sessions, time_step_min=15, rng=rng)
         meter = SimMeter(sim, noise_std_kw=0.3)
+        evse = SimEVSE(sim)
 
         prev_r = 0.0
         for step in range(96):
             t_min = step * 15
             meas_kw = meter.read_feeder_kw(t_min)
-            cmd_kw_total = sim.get_total_ev_power_kw()
+            cmd_kw_total = sum(evse.read_session_kw(s.session_id) for s in sessions)
             expected_kw = base_load[step] + cmd_kw_total
             feat = detector.extract_features(meas_kw, expected_kw, prev_residual_kw=prev_r)
             prev_r = float(feat[0])
@@ -138,7 +139,7 @@ def run_mpc_with_monitoring(
         # In SCADA/EMS systems, background base load is inferred from feeder telemetry:
         # P_base_inferred = max(0, meas_feeder_kw - ev_submetered_kw).
         # Under False Data Injection, this offset directly corrupts the scheduler's lookahead headroom!
-        current_ev_measured_kw = sim.get_total_ev_power_kw()
+        current_ev_measured_kw = sum(evse.read_session_kw(s.session_id) for s in sessions)
         inferred_current_base = max(0.0, meas_kw - current_ev_measured_kw)
         telemetry_offset_kw = inferred_current_base - curr_base_kw
 

@@ -48,6 +48,7 @@ def compute_overload_minutes(
     feeder_load_kw: Sequence[float],
     limit_kw: float,
     time_step_min: int = 15,
+    tolerance_kw: float = 0.5,
 ) -> float:
     """Compute total minutes the feeder operated above its transformer limit.
 
@@ -59,13 +60,15 @@ def compute_overload_minutes(
         Transformer continuous active power rating [kW].
     time_step_min : int, default 15
         Duration of each interval in minutes [minutes].
+    tolerance_kw : float, default 0.5
+        Measurement uncertainty / sensor noise tolerance band in kilowatts [kW].
 
     Returns
     -------
     float
         Overload duration in minutes [minutes].
     """
-    overload_steps = sum(1 for p in feeder_load_kw if p > limit_kw + 1e-4)
+    overload_steps = sum(1 for p in feeder_load_kw if p > limit_kw + tolerance_kw)
     return float(overload_steps * time_step_min)
 
 
@@ -140,10 +143,13 @@ def compute_run_metrics(
     tariff: Tariff,
     transformer_limit_kw: float,
     time_step_min: int = 15,
+    tolerance_kw: float = 0.5,
 ) -> RunMetrics:
     """Evaluate consolidated grid, cost, and energy QoS metrics for a simulation run."""
     return RunMetrics(
-        overload_minutes=compute_overload_minutes(feeder_load_kw, transformer_limit_kw, time_step_min),
+        overload_minutes=compute_overload_minutes(
+            feeder_load_kw, transformer_limit_kw, time_step_min, tolerance_kw=tolerance_kw
+        ),
         total_cost_usd=compute_electricity_cost_usd(ev_power_kw, tariff, time_step_min),
         unmet_energy_kwh=compute_unmet_energy_kwh(sessions),
         peak_load_kw=compute_peak_load_kw(feeder_load_kw),

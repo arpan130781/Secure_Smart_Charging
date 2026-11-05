@@ -52,24 +52,33 @@ def test_no_ev_exceeds_max_rate_kw() -> None:
 
     rng = np.random.default_rng(config["seed"])
     sessions = generate_synthetic_sessions(config, rng)
+    feeder = Feeder(
+        transformer_limit_kw=float(config["feeder"]["transformer_limit_kw"]),
+        base_load_profile_kw=[40.0] * 96,
+    )
 
-    # Track each session's power at each step manually to verify constraint
-    dt_hours = 15.0 / 60.0
-    for s in sessions:
-        s.delivered_energy_kwh = 0.0
+    result = run_uncontrolled_charging(
+        feeder=feeder,
+        sessions=sessions,
+        time_step_min=15,
+        num_steps=96,
+    )
 
+    # Verify that in every time step of the simulation, aggregate ev_load_kw does not
+    # exceed the sum of max_rate_kw of all vehicles connected at that step
     for step in range(96):
         t_min = step * 15
-        for s in sessions:
-            if s.is_connected(t_min):
-                rem_kwh = s.remaining_energy_req_kwh
-                if rem_kwh > 1e-4:
-                    power_kw = min(s.max_rate_kw, rem_kwh / dt_hours)
-                    # Property: instantaneous charging power cannot exceed max_rate_kw
-                    assert power_kw <= s.max_rate_kw + 1e-6, (
-                        f"EV {s.session_id} drew {power_kw:.3f} kW exceeding max_rate_kw {s.max_rate_kw:.3f} kW"
-                    )
-                    s.delivered_energy_kwh += power_kw * dt_hours
+        connected_evs = [s for s in sessions if s.is_connected(t_min)]
+        max_possible_aggregate_kw = sum(s.max_rate_kw for s in connected_evs)
+        actual_ev_kw = result.ev_load_kw[step]
+        assert actual_ev_kw <= max_possible_aggregate_kw + 1e-6, (
+            f"Step {step} (t={t_min} min): actual EV load {actual_ev_kw:.2f} kW "
+            f"exceeded maximum connected rating {max_possible_aggregate_kw:.2f} kW"
+        )
+        # Power per connected vehicle on average cannot exceed maximum individual rating
+        if connected_evs:
+            max_single_rating = max(s.max_rate_kw for s in connected_evs)
+            assert actual_ev_kw <= len(connected_evs) * max_single_rating + 1e-6
 
 
 def test_uncontrolled_charging_deterministic_for_fixed_seed() -> None:

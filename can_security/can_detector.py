@@ -46,6 +46,8 @@ class CANSecurityDetector:
         Minimum allowable battery terminal voltage in Volts [V].
     max_voltage_v : float, default 450.0
         Maximum allowable battery terminal voltage in Volts [V].
+    min_temp_c : float, default -20.0
+        Minimum safe operational battery temperature in degrees Celsius [deg C].
     max_temp_c : float, default 65.0
         Maximum safe operational battery temperature in degrees Celsius [deg C].
     """
@@ -57,6 +59,7 @@ class CANSecurityDetector:
         max_allowable_current_a: float = 200.0,
         min_voltage_v: float = 200.0,
         max_voltage_v: float = 450.0,
+        min_temp_c: float = -20.0,
         max_temp_c: float = 65.0,
     ) -> None:
         self.expected_period_s = expected_period_s
@@ -64,6 +67,7 @@ class CANSecurityDetector:
         self.max_allowable_current_a = max_allowable_current_a
         self.min_voltage_v = min_voltage_v
         self.max_voltage_v = max_voltage_v
+        self.min_temp_c = min_temp_c
         self.max_temp_c = max_temp_c
 
         self.last_msg_timestamp: float | None = None
@@ -147,11 +151,14 @@ class CANSecurityDetector:
             )
 
         # Check Temperature
-        if status.pack_temp_c > self.max_temp_c:
+        if status.pack_temp_c < self.min_temp_c or status.pack_temp_c > self.max_temp_c:
             return CANAnomalyAlert(
                 is_alarm=True,
                 alarm_type="payload_out_of_bounds",
-                details=f"Pack temperature {status.pack_temp_c:.1f} C exceeds thermal threshold {self.max_temp_c:.1f} C",
+                details=(
+                    f"Pack temperature {status.pack_temp_c:.1f} C outside safe operational range "
+                    f"[{self.min_temp_c:.1f}, {self.max_temp_c:.1f} C]"
+                ),
             )
 
         return CANAnomalyAlert(is_alarm=False, alarm_type=None, details="Message nominal")

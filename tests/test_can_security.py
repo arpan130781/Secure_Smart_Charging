@@ -42,6 +42,12 @@ def test_encode_and_decode_bms_status() -> None:
     assert pytest.approx(decoded.pack_temp_c, 1.0) == 28.0
     assert decoded.timestamp == 10.500
 
+    # Test extreme negative temperature clamping: -45 C clamps to -40 C dynamic floor without wrap-around
+    msg_cold = encode_bms_status(50.0, 380.0, 50.0, -45.0, timestamp=1.0)
+    decoded_cold = decode_bms_status(msg_cold)
+    assert decoded_cold is not None
+    assert decoded_cold.pack_temp_c == -40.0
+
 
 def test_can_detector_normal_periodic_traffic() -> None:
     detector = CANSecurityDetector(expected_period_s=0.100, timing_tolerance_s=0.030)
@@ -85,6 +91,13 @@ def test_can_detector_detects_value_tampering() -> None:
     assert alert_tampered.is_alarm
     assert alert_tampered.alarm_type == "payload_out_of_bounds"
     assert "550.0 A" in alert_tampered.details
+
+    # Low temperature anomaly test: pack temperature -25 C is below -20 C safe minimum
+    msg_freezing = encode_bms_status(90.0, 380.0, 50.0, -25.0, timestamp=2.200)
+    alert_freezing = detector.evaluate_message(msg_freezing)
+    assert alert_freezing.is_alarm
+    assert alert_freezing.alarm_type == "payload_out_of_bounds"
+    assert "-25.0 C" in alert_freezing.details
 
 
 def test_can_detector_detects_replay_attack() -> None:

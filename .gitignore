@@ -4,6 +4,8 @@ __pycache__/
 *$py.class
 *.egg-info/
 .pytest_cache/
+.mypy_cache/
+.coverage
 .DS_Store
 
 # Keep results/ tracked as requested by rules

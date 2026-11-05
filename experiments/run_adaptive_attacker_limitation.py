@@ -52,7 +52,8 @@ def run_adaptive_attack_limitation_experiment() -> dict:
         start_min=60,
         duration_min=120,
         base_forecast_profile_kw=base_forecast,
-        simulator=sim,
+        evse=evse,
+        session_ids=[s.session_id for s in sessions],
         noise_std_kw=0.2,
         seed=42,
     )
