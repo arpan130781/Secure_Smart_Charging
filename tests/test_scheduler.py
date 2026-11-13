@@ -7,13 +7,14 @@ Required checks:
 """
 
 import logging
+import math
 from typing import Any
 
 import cvxpy as cp
 import numpy as np
 import pytest
 
-from ev_sched.hal import SimEVSE, SimMeter
+from ev_sched.hal import EVSEInterface, MeterInterface, SimEVSE, SimMeter
 from ev_sched.models import EVSession, Feeder, Tariff
 from ev_sched.scheduler import (
     run_mpc_charging_loop,
@@ -353,6 +354,9 @@ def test_mpc_loop_updates_delivered_energy_via_evse_feedback_without_simulator()
         def read_feeder_kw(self, t_min: int) -> float:
             return 30.0
 
+        def get_reading_timestamp_s(self, t_min: int) -> float | None:
+            return float(t_min * 60.0)
+
     feeder = Feeder(transformer_limit_kw=60.0, base_load_profile_kw=[20.0] * 4)
     ev = EVSession(arrival_min=0, departure_min=60, energy_req_kwh=10.0, max_rate_kw=10.0, session_id="EV_HW_TEST")
     tariff = Tariff(price_per_kwh_per_15min=[0.1] * 4)
@@ -376,5 +380,435 @@ def test_mpc_loop_updates_delivered_energy_via_evse_feedback_without_simulator()
     assert ev.delivered_energy_kwh > 0.0
     assert np.isclose(ev.delivered_energy_kwh, 10.0, atol=1e-2)
     assert np.isclose(sum(res.total_ev_power_kw) * 0.25, 10.0, atol=1e-2)
+
+
+def test_mpc_handles_evse_command_exception() -> None:
+    """EVSE setpoint dispatch exceptions must not crash MPC and must trigger safe mode."""
+    class FailingCommandEVSE(EVSEInterface):
+        def set_setpoint_kw(self, ev_id: str, power_kw: float) -> None:
+            raise RuntimeError("EVSE communication timeout during setpoint dispatch")
+
+        def read_session_kw(self, ev_id: str) -> float:
+            return 0.0
+
+    class ConstantMeter(MeterInterface):
+        def read_feeder_kw(self, t_min: int) -> float:
+            return 25.0
+
+        def get_reading_timestamp_s(self, t_min: int) -> float | None:
+            return float(t_min * 60.0)
+
+    feeder = Feeder(transformer_limit_kw=60.0, base_load_profile_kw=[20.0] * 4)
+    ev = EVSession(arrival_min=0, departure_min=60, energy_req_kwh=10.0, max_rate_kw=7.2, session_id="EV_FAIL_CMD")
+    tariff = Tariff(price_per_kwh_per_15min=[0.1] * 4)
+
+    evse = FailingCommandEVSE()
+    meter = ConstantMeter()
+
+    res = run_mpc_charging_loop(
+        feeder=feeder,
+        sessions=[ev],
+        tariff=tariff,
+        meter=meter,
+        evse=evse,
+        simulator=None,
+        time_step_min=15,
+        num_steps=4,
+    )
+
+    # 1. Controller does not crash and returns full simulation result
+    assert res is not None
+    assert len(res.total_ev_power_kw) == 4
+
+    # 2. Safe state is entered and reported
+    assert any(res.safe_mode_active)
+    assert any(res.alarms_raised)
+
+    # 3. Feeder power calculations remain finite and non-negative
+    for p in res.total_ev_power_kw:
+        assert math.isfinite(p) and p >= 0.0
+    for f in res.true_feeder_kw:
+        assert math.isfinite(f) and f >= 0.0
+    for o in res.overload_kw:
+        assert math.isfinite(o) and o >= 0.0
+
+
+def test_mpc_handles_evse_readback_exception() -> None:
+    """EVSE readback exceptions must not crash MPC, must be rejected, and must enter safe mode."""
+    class FailingReadbackEVSE(EVSEInterface):
+        def __init__(self) -> None:
+            self.dispatched: dict[str, float] = {}
+
+        def set_setpoint_kw(self, ev_id: str, power_kw: float) -> None:
+            self.dispatched[ev_id] = power_kw
+
+        def read_session_kw(self, ev_id: str) -> float:
+            raise OSError("Submeter bus connection dropped")
+
+    class ConstantMeter(MeterInterface):
+        def read_feeder_kw(self, t_min: int) -> float:
+            return 25.0
+
+        def get_reading_timestamp_s(self, t_min: int) -> float | None:
+            return float(t_min * 60.0)
+
+    feeder = Feeder(transformer_limit_kw=60.0, base_load_profile_kw=[20.0] * 4)
+    ev = EVSession(arrival_min=0, departure_min=60, energy_req_kwh=10.0, max_rate_kw=7.2, session_id="EV_FAIL_READ")
+    tariff = Tariff(price_per_kwh_per_15min=[0.1] * 4)
+
+    evse = FailingReadbackEVSE()
+    meter = ConstantMeter()
+
+    res = run_mpc_charging_loop(
+        feeder=feeder,
+        sessions=[ev],
+        tariff=tariff,
+        meter=meter,
+        evse=evse,
+        simulator=None,
+        time_step_min=15,
+        num_steps=4,
+    )
+
+    assert res is not None
+    assert any(res.safe_mode_active)
+    assert any(res.alarms_raised)
+
+    for p in res.total_ev_power_kw:
+        assert math.isfinite(p) and p >= 0.0
+    for f in res.true_feeder_kw:
+        assert math.isfinite(f) and f >= 0.0
+    for o in res.overload_kw:
+        assert math.isfinite(o) and o >= 0.0
+
+
+@pytest.mark.parametrize("invalid_reading", [float("nan"), float("inf"), float("-inf"), -50.0])
+def test_mpc_rejects_nan_infinite_and_invalid_evse_readbacks(invalid_reading: float) -> None:
+    """EVSE readbacks containing NaN, inf, or negative power must be rejected without poisoning feeder calculations."""
+    class InvalidReadbackEVSE(EVSEInterface):
+        def __init__(self, val: float) -> None:
+            self.val = val
+
+        def set_setpoint_kw(self, ev_id: str, power_kw: float) -> None:
+            pass
+
+        def read_session_kw(self, ev_id: str) -> float:
+            return self.val
+
+    class ConstantMeter(MeterInterface):
+        def read_feeder_kw(self, t_min: int) -> float:
+            return 25.0
+
+        def get_reading_timestamp_s(self, t_min: int) -> float | None:
+            return float(t_min * 60.0)
+
+    feeder = Feeder(transformer_limit_kw=60.0, base_load_profile_kw=[20.0] * 4)
+    ev = EVSession(arrival_min=0, departure_min=60, energy_req_kwh=10.0, max_rate_kw=7.2, session_id="EV_INVALID_READ")
+    tariff = Tariff(price_per_kwh_per_15min=[0.1] * 4)
+
+    evse = InvalidReadbackEVSE(invalid_reading)
+    meter = ConstantMeter()
+
+    res = run_mpc_charging_loop(
+        feeder=feeder,
+        sessions=[ev],
+        tariff=tariff,
+        meter=meter,
+        evse=evse,
+        simulator=None,
+        time_step_min=15,
+        num_steps=4,
+    )
+
+    assert res is not None
+
+    # Safe state is entered
+    assert any(res.safe_mode_active)
+
+    # Invalid reading is rejected: no NaNs or infinities appear in feeder power calculations
+    for p in res.total_ev_power_kw:
+        assert math.isfinite(p), f"total_ev_power_kw contained non-finite value: {p}"
+        assert p >= 0.0
+    for f in res.true_feeder_kw:
+        assert math.isfinite(f), f"true_feeder_kw contained non-finite value: {f}"
+        assert f >= 0.0
+    for o in res.overload_kw:
+        assert math.isfinite(o), f"overload_kw contained non-finite value: {o}"
+        assert o >= 0.0
+
+    # Delivered energy is not poisoned by NaN
+    assert math.isfinite(ev.delivered_energy_kwh)
+
+
+# ==============================================================================
+# Audit Regression Tests: Primary Meter Validation & Actuation Emergency Stop
+# ==============================================================================
+
+class FaultyPrimaryMeter(MeterInterface):
+    """Primary meter simulating communication exceptions, non-finite values, and stale state."""
+
+    def __init__(self, mode: str, is_stale: bool = False, timestamp_offset_min: float = 0.0) -> None:
+        self.mode = mode
+        self.is_stale = is_stale
+        self.timestamp_offset_min = timestamp_offset_min
+
+    def get_reading_timestamp_s(self, t_min: int) -> float | None:
+        if self.mode == "none_timestamp":
+            return None
+        return float((t_min + self.timestamp_offset_min) * 60.0)
+
+    def read_feeder_kw(self, t_min: int) -> float:
+        if self.mode == "exception":
+            raise RuntimeError("Substation Modbus communication failure")
+        if self.mode == "nan":
+            return float("nan")
+        if self.mode == "inf":
+            return float("inf")
+        if self.mode == "negative":
+            return -25.0
+        return 35.0
+
+
+class DummyFreshEVSE(EVSEInterface):
+    """Simple EVSE that tracks setpoints and reflects delivered power."""
+
+    def __init__(self) -> None:
+        self.dispatched: dict[str, float] = {}
+
+    def set_setpoint_kw(self, ev_id: str, power_kw: float) -> None:
+        self.dispatched[ev_id] = max(0.0, float(power_kw))
+
+    def read_session_kw(self, ev_id: str) -> float:
+        return self.dispatched.get(ev_id, 0.0)
+
+
+def test_primary_meter_exception_latches_safe_mode_and_applies_fallback() -> None:
+    """Primary meter query exceptions must latch safe mode and apply zero-charge or independent cap fallback."""
+    feeder = Feeder(transformer_limit_kw=60.0, base_load_profile_kw=[25.0] * 4)
+    sessions = [EVSession(arrival_min=0, departure_min=60, energy_req_kwh=10.0, max_rate_kw=7.2, session_id="EV_EXC")]
+    tariff = Tariff(price_per_kwh_per_15min=[0.1] * 4)
+
+    evse = DummyFreshEVSE()
+    meter_exc = FaultyPrimaryMeter("exception")
+
+    # 1. No independent aggregate cap -> fall back to zero charging
+    res_zero = run_mpc_charging_loop(
+        feeder=feeder,
+        sessions=sessions,
+        tariff=tariff,
+        meter=meter_exc,
+        evse=evse,
+        simulator=None,
+        time_step_min=15,
+        num_steps=4,
+        max_aggregate_ev_kw=None,
+    )
+    assert res_zero is not None
+    assert all(res_zero.safe_mode_active), "Safe mode was not latched across all steps!"
+    assert all(res_zero.alarms_raised), "Alarm was not raised on primary meter failure!"
+    assert res_zero.is_protection_active is False
+    assert all(p == 0.0 for p in res_zero.total_ev_power_kw), "Zero charging fallback was not enforced!"
+    for f in res_zero.true_feeder_kw:
+        assert math.isfinite(f) and f >= 0.0
+    for o in res_zero.overload_kw:
+        assert math.isfinite(o) and o >= 0.0
+
+    # 2. Independent aggregate cap provided -> safe mode latched but capped by independent cap
+    res_cap = run_mpc_charging_loop(
+        feeder=feeder,
+        sessions=sessions,
+        tariff=tariff,
+        meter=meter_exc,
+        evse=evse,
+        simulator=None,
+        time_step_min=15,
+        num_steps=4,
+        max_aggregate_ev_kw=5.0,
+    )
+    assert all(res_cap.safe_mode_active)
+    assert all(res_cap.alarms_raised)
+    assert res_cap.is_protection_active is True
+    assert max(res_cap.total_ev_power_kw) <= 5.0 + 1e-4
+
+
+@pytest.mark.parametrize("bad_mode", ["nan", "inf", "negative"])
+def test_primary_meter_non_finite_and_negative_values(bad_mode: str) -> None:
+    """Primary meter returning NaN, inf, or negative values must latch safe mode and apply fallback."""
+    feeder = Feeder(transformer_limit_kw=60.0, base_load_profile_kw=[25.0] * 4)
+    sessions = [EVSession(arrival_min=0, departure_min=60, energy_req_kwh=10.0, max_rate_kw=7.2, session_id="EV_BAD")]
+    tariff = Tariff(price_per_kwh_per_15min=[0.1] * 4)
+
+    evse = DummyFreshEVSE()
+    meter_bad = FaultyPrimaryMeter(bad_mode)
+
+    res = run_mpc_charging_loop(
+        feeder=feeder,
+        sessions=sessions,
+        tariff=tariff,
+        meter=meter_bad,
+        evse=evse,
+        simulator=None,
+        time_step_min=15,
+        num_steps=4,
+        max_aggregate_ev_kw=None,
+    )
+    assert all(res.safe_mode_active)
+    assert all(res.alarms_raised)
+    assert all(p == 0.0 for p in res.total_ev_power_kw)
+    for f in res.true_feeder_kw:
+        assert math.isfinite(f) and f >= 0.0
+    for o in res.overload_kw:
+        assert math.isfinite(o) and o >= 0.0
+
+
+def test_primary_meter_stale_and_unverified_freshness() -> None:
+    """Primary meter with is_stale, expired timestamps, or unverified timestamps must latch safe mode."""
+    feeder = Feeder(transformer_limit_kw=60.0, base_load_profile_kw=[25.0] * 4)
+    sessions = [EVSession(arrival_min=0, departure_min=60, energy_req_kwh=10.0, max_rate_kw=7.2, session_id="EV_STALE")]
+    tariff = Tariff(price_per_kwh_per_15min=[0.1] * 4)
+    evse = DummyFreshEVSE()
+
+    stale_meters = [
+        FaultyPrimaryMeter("normal", is_stale=True),
+        FaultyPrimaryMeter("normal", timestamp_offset_min=-30.0),  # expired: 30 minutes in the past
+        FaultyPrimaryMeter("none_timestamp"),  # unverified freshness
+    ]
+
+    for m in stale_meters:
+        res = run_mpc_charging_loop(
+            feeder=feeder,
+            sessions=sessions,
+            tariff=tariff,
+            meter=m,
+            evse=evse,
+            simulator=None,
+            time_step_min=15,
+            num_steps=4,
+            max_aggregate_ev_kw=None,
+        )
+        assert all(res.safe_mode_active), f"Safe mode not latched for stale meter: {m.mode}, {m.is_stale}"
+        assert all(res.alarms_raised)
+        assert all(p == 0.0 for p in res.total_ev_power_kw)
+
+
+def test_evse_over_delivery_triggers_actuation_failure_and_emergency_stop() -> None:
+    """Significant EVSE over-delivery (> 0.1 kW) must trigger actuation failure and emergency shutdown."""
+    class OverDeliveringEVSE(EVSEInterface):
+        def __init__(self) -> None:
+            self.dispatched: dict[str, float] = {}
+            self.emergency_stopped = False
+
+        def set_setpoint_kw(self, ev_id: str, power_kw: float) -> None:
+            self.dispatched[ev_id] = power_kw
+            if power_kw == 0.0:
+                self.emergency_stopped = True
+
+        def read_session_kw(self, ev_id: str) -> float:
+            cmd = self.dispatched.get(ev_id, 0.0)
+            if self.emergency_stopped:
+                return 0.0
+            # Over-deliver: if commanded 2.0 kW, delivers 6.0 kW (+4.0 kW mismatch)
+            return cmd + 4.0 if cmd > 0.0 else 0.0
+
+    class ConstantMeter(MeterInterface):
+        def read_feeder_kw(self, t_min: int) -> float:
+            return 30.0
+
+        def get_reading_timestamp_s(self, t_min: int) -> float | None:
+            return float(t_min * 60.0)
+
+    feeder = Feeder(transformer_limit_kw=60.0, base_load_profile_kw=[25.0] * 4)
+    sessions = [EVSession(arrival_min=0, departure_min=60, energy_req_kwh=10.0, max_rate_kw=7.2, session_id="EV_OVER")]
+    tariff = Tariff(price_per_kwh_per_15min=[0.1] * 4)
+
+    evse = OverDeliveringEVSE()
+    meter = ConstantMeter()
+
+    res = run_mpc_charging_loop(
+        feeder=feeder,
+        sessions=sessions,
+        tariff=tariff,
+        meter=meter,
+        evse=evse,
+        simulator=None,
+        time_step_min=15,
+        num_steps=4,
+    )
+
+    # 1. Actuation discrepancy was caught
+    assert evse.emergency_stopped is True, "Emergency stop set_setpoint_kw(0.0) was not called on mismatch!"
+    # 2. Safe mode latched and alarms raised
+    assert all(res.safe_mode_active)
+    assert any(res.alarms_raised)
+    assert res.is_protection_active is False
+
+
+def test_one_session_command_failure_stops_all_sessions_in_same_step() -> None:
+    """An EVSE actuation failure on one session must attempt to stop all sessions in the same step."""
+    class ClusterEVSE(EVSEInterface):
+        def __init__(self) -> None:
+            self.dispatched: dict[str, float] = {}
+            self.stopped_sessions: set[str] = set()
+
+        def set_setpoint_kw(self, ev_id: str, power_kw: float) -> None:
+            if ev_id == "EV_FAIL" and power_kw > 0.0:
+                raise RuntimeError("EVSE hardware communication fault on EV_FAIL")
+            self.dispatched[ev_id] = power_kw
+            if power_kw == 0.0:
+                self.stopped_sessions.add(ev_id)
+
+        def read_session_kw(self, ev_id: str) -> float:
+            if ev_id == "EV_FAIL":
+                # Stale or stuck readback on failed EVSE
+                return 4.5
+            # Healthy EVSE successfully reaches 0.0 when stopped
+            if ev_id in self.stopped_sessions:
+                return 0.0
+            return self.dispatched.get(ev_id, 0.0)
+
+    class ConstantMeter(MeterInterface):
+        def read_feeder_kw(self, t_min: int) -> float:
+            return 30.0
+
+        def get_reading_timestamp_s(self, t_min: int) -> float | None:
+            return float(t_min * 60.0)
+
+    feeder = Feeder(transformer_limit_kw=60.0, base_load_profile_kw=[25.0] * 4)
+    sessions = [
+        EVSession(arrival_min=0, departure_min=60, energy_req_kwh=10.0, max_rate_kw=7.2, session_id="EV_HEALTHY"),
+        EVSession(arrival_min=0, departure_min=60, energy_req_kwh=10.0, max_rate_kw=7.2, session_id="EV_FAIL"),
+    ]
+    tariff = Tariff(price_per_kwh_per_15min=[0.1] * 4)
+
+    evse = ClusterEVSE()
+    meter = ConstantMeter()
+
+    res = run_mpc_charging_loop(
+        feeder=feeder,
+        sessions=sessions,
+        tariff=tariff,
+        meter=meter,
+        evse=evse,
+        simulator=None,
+        time_step_min=15,
+        num_steps=4,
+    )
+
+    # 1. Emergency stop attempted across ALL sessions
+    assert "EV_HEALTHY" in evse.stopped_sessions, "Healthy EV was not stopped when neighbor failed!"
+
+    # 2. Unconfirmed zero power correctly reported for EV_FAIL
+    assert any(res.zero_power_unconfirmed), "zero_power_unconfirmed was not flagged!"
+    assert any("EV_FAIL" in unconf for unconf in res.unconfirmed_zero_sessions), "EV_FAIL not in unconfirmed list!"
+    # EV_HEALTHY reached 0.0 kW, so it should NOT be in unconfirmed list
+    for unconf in res.unconfirmed_zero_sessions:
+        assert "EV_HEALTHY" not in unconf, "EV_HEALTHY was confirmed zero and should not be unconfirmed!"
+
+    # 3. Safe mode latched
+    assert all(res.safe_mode_active)
+    assert any(res.alarms_raised)
+
+    for s in sessions:
+        assert s.delivered_energy_kwh >= 0.0
 
 

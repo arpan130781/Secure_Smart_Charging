@@ -34,6 +34,43 @@ class MeterInterface(ABC):
         """
         raise NotImplementedError
 
+    def get_reading_timestamp_s(self, t_min: int) -> float | None:
+        """[FRESHNESS] Return acquisition timestamp in seconds [s] for the reading at t_min.
+
+        Returns None by default on base MeterInterface implementations that do not
+        support cryptographic or timestamped freshness verification.
+        """
+        return None
+
+    def is_reading_fresh(self, t_min: int, max_age_s: float = 900.0) -> bool:
+        """[FRESHNESS] Check whether the meter sample at t_min is verifiable and fresh.
+
+        Parameters
+        ----------
+        t_min : int
+            Current controller simulation time in minutes.
+        max_age_s : float, default 900.0 (15 minutes)
+            Maximum permissible age of the sample in seconds.
+
+        Returns
+        -------
+        bool
+            True if sample has a valid, finite timestamp within [t_now - max_age_s, t_now];
+            False if freshness cannot be established (timestamp missing/None) or is expired.
+        """
+        ts = self.get_reading_timestamp_s(t_min)
+        if ts is None:
+            return False
+        try:
+            ts_float = float(ts)
+        except (TypeError, ValueError):
+            return False
+        if not np.isfinite(ts_float):
+            return False
+        t_now_s = float(t_min * 60)
+        age_s = t_now_s - ts_float
+        return 0.0 <= age_s <= max_age_s
+
 
 class EVSEInterface(ABC):
     """Abstract interface for EVSE (Electric Vehicle Supply Equipment) telemetry & control."""
@@ -98,6 +135,21 @@ class SimMeter(MeterInterface):
     def reset(self) -> None:
         """Clear cached sensor noise realizations."""
         self._noise_cache.clear()
+
+    def bind_simulator(self, simulator: Any) -> None:
+        """Bind or rebind the meter to a specific simulation instance.
+
+        Parameters
+        ----------
+        simulator : Any
+            Target grid and EV simulation instance.
+        """
+        self._sim = simulator
+        self.reset()
+
+    def get_reading_timestamp_s(self, t_min: int) -> float | None:
+        """[FRESHNESS] Return synchronous sample timestamp in seconds (t_min * 60.0)."""
+        return float(t_min * 60.0)
 
     def read_feeder_kw(self, t_min: int) -> float:
         """[MEASURED] Return measured active feeder power from simulator.

@@ -8,7 +8,11 @@ Includes:
 from dataclasses import dataclass
 
 import numpy as np
-from sklearn.ensemble import IsolationForest
+
+try:
+    from sklearn.ensemble import IsolationForest
+except ImportError:
+    IsolationForest = None  # type: ignore
 
 
 @dataclass(frozen=True)
@@ -129,6 +133,100 @@ class CUSUMDetector:
         )
 
 
+class KalmanChiSquareDetector:
+    """Detector 2 (Classical Control): Discrete-time Kalman Filter State Estimator & Chi-Square Detector.
+
+    Replaces black-box Machine Learning with a deterministic, physically grounded dynamic state observer.
+    Ingests active power measurements, predicts physical state evolution, and tests the normalized
+    innovation residual against a Chi-Square (chi^2) distribution. Executes in O(1) time and memory,
+    ideal for microcontrollers and embedded Energy Management Systems.
+    """
+
+    def __init__(
+        self,
+        q_process: float = 0.5,
+        r_meas: float = 0.09,
+        chisq_threshold: float = 9.0,
+        ewma_alpha: float = 0.3,
+    ) -> None:
+        self.q_process = q_process
+        self.r_meas = r_meas
+        self.chisq_threshold = chisq_threshold
+        self.ewma_alpha = ewma_alpha
+        self.x_hat: float = 0.0
+        self.p_cov: float = 1.0
+        self.ewma_chisq: float = 0.0
+        self.initialized: bool = False
+        self.prev_residual_kw: float = 0.0
+
+    def reset(self) -> None:
+        """Reset internal filter state."""
+        self.x_hat = 0.0
+        self.p_cov = 1.0
+        self.ewma_chisq = 0.0
+        self.initialized = False
+        self.prev_residual_kw = 0.0
+
+    def fit_from_attack_free_runs(self, training_feature_matrix: np.ndarray) -> None:
+        """Calibrate measurement noise variance R from attack-free baseline telemetry."""
+        if len(training_feature_matrix) > 0:
+            residuals = training_feature_matrix[:, 0]
+            var = float(np.var(residuals))
+            if var > 1e-4:
+                self.r_meas = var
+
+    def extract_features(
+        self,
+        reported_feeder_kw: float,
+        expected_feeder_kw: float,
+        prev_residual_kw: float | None = None,
+    ) -> np.ndarray:
+        """Construct feature vector for step t."""
+        residual = reported_feeder_kw - expected_feeder_kw
+        prev_r = self.prev_residual_kw if prev_residual_kw is None else prev_residual_kw
+        delta_r = residual - prev_r
+        ratio = reported_feeder_kw / max(1.0, expected_feeder_kw)
+        return np.array([residual, delta_r, ratio], dtype=float)
+
+    def update(
+        self,
+        reported_feeder_kw: float,
+        expected_feeder_kw: float,
+    ) -> DetectorAlert:
+        """Evaluate meter telemetry using discrete-time Kalman filter and Chi-Square anomaly metric."""
+        if not self.initialized:
+            self.x_hat = expected_feeder_kw
+            self.p_cov = self.q_process
+            self.initialized = True
+
+        # 1. Time update (Predict)
+        x_prior = expected_feeder_kw
+        p_prior = self.p_cov + self.q_process
+
+        # 2. Measurement innovation: FDI attacks hide load (under-report)
+        innovation = expected_feeder_kw - reported_feeder_kw
+        innovation_cov = p_prior + self.r_meas
+
+        # 3. Measurement update (Correct)
+        k_gain = p_prior / innovation_cov
+        self.x_hat = x_prior - (k_gain * innovation)
+        self.p_cov = (1.0 - k_gain) * p_prior
+
+        # 4. Chi-Square distance: d^2 = innovation^2 / S
+        chisq_dist = (innovation * innovation) / innovation_cov
+        self.ewma_chisq = (self.ewma_alpha * chisq_dist) + ((1.0 - self.ewma_alpha) * self.ewma_chisq)
+
+        # Anomaly decision rule
+        is_alarm = bool((chisq_dist > self.chisq_threshold) or (self.ewma_chisq > 0.6 * self.chisq_threshold))
+        self.prev_residual_kw = float(innovation)
+
+        return DetectorAlert(
+            is_alarm=is_alarm,
+            residual_kw=float(innovation),
+            statistic_value=float(chisq_dist),
+        )
+
+
 class IsolationForestDetector:
     """Detector 2: Machine Learning Isolation Forest anomaly detector.
 
@@ -155,11 +253,15 @@ class IsolationForestDetector:
     def __init__(self, contamination: float = 0.01, random_state: int = 42) -> None:
         self.contamination = contamination
         self.random_state = random_state
-        self.model = IsolationForest(
-            contamination=contamination,
-            random_state=random_state,
-            n_estimators=100,
-        )
+        if IsolationForest is not None:
+            self.model = IsolationForest(
+                contamination=contamination,
+                random_state=random_state,
+                n_estimators=100,
+            )
+        else:
+            self.model = None
+            self._kalman_fallback = KalmanChiSquareDetector()
         self.is_fitted: bool = False
         self.prev_residual_kw: float = 0.0
 
@@ -184,12 +286,17 @@ class IsolationForestDetector:
         training_feature_matrix : np.ndarray
             Matrix of shape (M, 3) where each row is [residual, delta_residual, ratio].
         """
-        self.model.fit(training_feature_matrix)
+        if self.model is not None:
+            self.model.fit(training_feature_matrix)
+        elif hasattr(self, "_kalman_fallback"):
+            self._kalman_fallback.fit_from_attack_free_runs(training_feature_matrix)
         self.is_fitted = True
 
     def reset(self) -> None:
         """Reset step-to-step memory."""
         self.prev_residual_kw = 0.0
+        if hasattr(self, "_kalman_fallback"):
+            self._kalman_fallback.reset()
 
     def update(
         self,
@@ -210,6 +317,9 @@ class IsolationForestDetector:
         DetectorAlert
             Alarm flag, residual [kW], and decision function anomaly score.
         """
+        if self.model is None and hasattr(self, "_kalman_fallback"):
+            return self._kalman_fallback.update(reported_feeder_kw, expected_feeder_kw)
+
         feat = self.extract_features(reported_feeder_kw, expected_feeder_kw).reshape(1, -1)
         residual = float(feat[0, 0])
         self.prev_residual_kw = residual

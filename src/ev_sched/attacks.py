@@ -57,6 +57,14 @@ class ConstantBiasMeter(MeterInterface):
         """Return True if cyber-attack is actively injecting false data at t_min."""
         return self.start_min <= t_min < self.end_min
 
+    def get_reading_timestamp_s(self, t_min: int) -> float | None:
+        """[FRESHNESS] Return acquisition timestamp from inner meter."""
+        return self.inner_meter.get_reading_timestamp_s(t_min)
+
+    def is_reading_fresh(self, t_min: int, max_age_s: float = 900.0) -> bool:
+        """[FRESHNESS] Verify sample freshness from inner meter."""
+        return self.inner_meter.is_reading_fresh(t_min, max_age_s=max_age_s)
+
     def read_feeder_kw(self, t_min: int) -> float:
         """[MEASURED] Return attacked feeder active power reading in kilowatts [kW]."""
         true_kw = self.inner_meter.read_feeder_kw(t_min)
@@ -99,6 +107,14 @@ class RampAttackMeter(MeterInterface):
     def is_attack_active(self, t_min: int) -> bool:
         """Return True if cyber-attack is actively injecting false data at t_min."""
         return self.start_min <= t_min < self.end_min
+
+    def get_reading_timestamp_s(self, t_min: int) -> float | None:
+        """[FRESHNESS] Return acquisition timestamp from inner meter."""
+        return self.inner_meter.get_reading_timestamp_s(t_min)
+
+    def is_reading_fresh(self, t_min: int, max_age_s: float = 900.0) -> bool:
+        """[FRESHNESS] Verify sample freshness from inner meter."""
+        return self.inner_meter.is_reading_fresh(t_min, max_age_s=max_age_s)
 
     def get_current_delta_kw(self, t_min: int) -> float:
         """Return the instantaneous injected bias at elapsed minute t_min [kW]."""
@@ -153,6 +169,14 @@ class ReplayAttackMeter(MeterInterface):
         """Return True if cyber-attack is actively replaying telemetry at t_min."""
         return self.start_min <= t_min < self.end_min
 
+    def get_reading_timestamp_s(self, t_min: int) -> float | None:
+        """[FRESHNESS] Return acquisition timestamp from inner meter."""
+        return self.inner_meter.get_reading_timestamp_s(t_min)
+
+    def is_reading_fresh(self, t_min: int, max_age_s: float = 900.0) -> bool:
+        """[FRESHNESS] Verify sample freshness from inner meter."""
+        return self.inner_meter.is_reading_fresh(t_min, max_age_s=max_age_s)
+
     def read_feeder_kw(self, t_min: int) -> float:
         """[MEASURED] Return replayed or real-time feeder reading in kilowatts [kW]."""
         true_kw = self.inner_meter.read_feeder_kw(t_min)
@@ -163,6 +187,92 @@ class ReplayAttackMeter(MeterInterface):
         if self.is_attack_active(t_min):
             offset_min = t_min - self.start_min
             target_t = self.replay_source_start_min + offset_min
+            return self._buffer.get(target_t, true_kw)
+
+        return true_kw
+
+
+class SimilarLoadReplayAttackMeter(MeterInterface):
+    """Wraps MeterInterface with a smart replay attack selecting a similar-load historical window.
+
+    Rather than replaying a fixed historical timestamp (which can create an abrupt
+    step-discontinuity at attack onset), this attacker searches the recorded history buffer
+    for a window of length duration_min whose initial (or average) active power closest matches
+    the target active load at attack start.
+
+    Parameters
+    ----------
+    inner_meter : MeterInterface
+        The physical or simulated meter being wrapped.
+    start_min : int
+        Simulation elapsed time when replay attack begins in minutes [minutes].
+    duration_min : int
+        Duration of the attack window in minutes [minutes].
+    candidate_search_start_min : int, default 0
+        Earliest historical timestamp allowed for replay selection in minutes [minutes].
+    candidate_search_end_min : Optional[int], default None
+        Latest timestamp allowed for replay selection (defaults to start_min) in minutes [minutes].
+    target_match_kw : Optional[float], default None
+        Specific load target to match. If None, matches the reading at start_min.
+    """
+
+    def __init__(
+        self,
+        inner_meter: MeterInterface,
+        start_min: int,
+        duration_min: int,
+        candidate_search_start_min: int = 0,
+        candidate_search_end_min: int | None = None,
+        target_match_kw: float | None = None,
+    ) -> None:
+        self.inner_meter = inner_meter
+        self.start_min = start_min
+        self.duration_min = duration_min
+        self.end_min = start_min + duration_min
+        self.candidate_search_start_min = candidate_search_start_min
+        self.candidate_search_end_min = (
+            candidate_search_end_min if candidate_search_end_min is not None else start_min
+        )
+        self.target_match_kw = target_match_kw
+        self._buffer: dict[int, float] = {}
+        self._selected_source_start_min: int | None = None
+
+    def is_attack_active(self, t_min: int) -> bool:
+        """Return True if cyber-attack is actively replaying telemetry at t_min."""
+        return self.start_min <= t_min < self.end_min
+
+    def get_reading_timestamp_s(self, t_min: int) -> float | None:
+        """[FRESHNESS] Return acquisition timestamp from inner meter."""
+        return self.inner_meter.get_reading_timestamp_s(t_min)
+
+    def is_reading_fresh(self, t_min: int, max_age_s: float = 900.0) -> bool:
+        """[FRESHNESS] Verify sample freshness from inner meter."""
+        return self.inner_meter.is_reading_fresh(t_min, max_age_s=max_age_s)
+
+    def _select_best_window(self, target_kw: float) -> int:
+        """Search buffer for candidate start timestamp whose reading closest matches target_kw."""
+        valid_candidates = [
+            t for t in sorted(self._buffer.keys())
+            if self.candidate_search_start_min <= t <= self.candidate_search_end_min - self.duration_min
+        ]
+        if not valid_candidates:
+            return self.candidate_search_start_min
+        best_t = min(valid_candidates, key=lambda t: abs(self._buffer[t] - target_kw))
+        return int(best_t)
+
+    def read_feeder_kw(self, t_min: int) -> float:
+        """[MEASURED] Return replayed or real-time feeder reading in kilowatts [kW]."""
+        true_kw = self.inner_meter.read_feeder_kw(t_min)
+        if t_min not in self._buffer:
+            self._buffer[t_min] = true_kw
+
+        if self.is_attack_active(t_min):
+            if self._selected_source_start_min is None:
+                target = self.target_match_kw if self.target_match_kw is not None else true_kw
+                self._selected_source_start_min = self._select_best_window(target)
+
+            offset_min = t_min - self.start_min
+            target_t = self._selected_source_start_min + offset_min
             return self._buffer.get(target_t, true_kw)
 
         return true_kw
@@ -238,6 +348,14 @@ class AdaptiveAttackMeter(MeterInterface):
         """Return True if cyber-attack is actively injecting false data at t_min."""
         return self.start_min <= t_min < self.end_min
 
+    def get_reading_timestamp_s(self, t_min: int) -> float | None:
+        """[FRESHNESS] Return acquisition timestamp from inner meter."""
+        return self.inner_meter.get_reading_timestamp_s(t_min)
+
+    def is_reading_fresh(self, t_min: int, max_age_s: float = 900.0) -> bool:
+        """[FRESHNESS] Verify sample freshness from inner meter."""
+        return self.inner_meter.is_reading_fresh(t_min, max_age_s=max_age_s)
+
     def read_feeder_kw(self, t_min: int) -> float:
         """[MEASURED] Return adaptive feeder reading in kilowatts [kW]."""
         true_kw = self.inner_meter.read_feeder_kw(t_min)
@@ -306,12 +424,30 @@ def create_attacked_meter(inner_meter: MeterInterface, config: dict[str, Any]) -
             max_delta_kw=magnitude_kw,
         )
     elif atk_type == "replay":
+        if config.get("similar_load", False):
+            return SimilarLoadReplayAttackMeter(
+                inner_meter=inner_meter,
+                start_min=start_min,
+                duration_min=duration_min,
+                candidate_search_start_min=int(config.get("candidate_search_start_min", 0)),
+                candidate_search_end_min=config.get("candidate_search_end_min"),
+                target_match_kw=config.get("target_match_kw"),
+            )
         replay_source = int(config.get("replay_source_start_min", 60))
         return ReplayAttackMeter(
             inner_meter=inner_meter,
             start_min=start_min,
             duration_min=duration_min,
             replay_source_start_min=replay_source,
+        )
+    elif atk_type == "similar_load_replay":
+        return SimilarLoadReplayAttackMeter(
+            inner_meter=inner_meter,
+            start_min=start_min,
+            duration_min=duration_min,
+            candidate_search_start_min=int(config.get("candidate_search_start_min", 0)),
+            candidate_search_end_min=config.get("candidate_search_end_min"),
+            target_match_kw=config.get("target_match_kw"),
         )
     elif atk_type == "adaptive":
         base_forecast = config.get("base_forecast_profile_kw", [30.0] * 96)

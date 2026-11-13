@@ -141,6 +141,9 @@ def audit_receding_horizon_and_meter_reads() -> None:
             self.base_val = base_val
             self.read_history: list[int] = []
 
+        def get_reading_timestamp_s(self, t_min: int) -> float | None:
+            return float(t_min * 60.0)
+
         def read_feeder_kw(self, t_min: int) -> float:
             self.read_history.append(t_min)
             return self.base_val
@@ -216,6 +219,9 @@ def audit_telemetry_isolation() -> None:
     class CorruptedMeter(MeterInterface):
         def __init__(self, corrupted_kw: float) -> None:
             self.corrupted_kw = corrupted_kw
+
+        def get_reading_timestamp_s(self, t_min: int) -> float | None:
+            return float(t_min * 60.0)
 
         def read_feeder_kw(self, t_min: int) -> float:
             return self.corrupted_kw

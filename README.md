@@ -99,6 +99,20 @@ To preserve scientific validity, all variables in code, logs, and interfaces are
 | `residual_kw` | `DetectorAlert.residual_kw` | **[DERIVED]** | Innovation residual $r(t) = y_{\text{meter}}(t) - (\hat{P}_{\text{base}}(t) + \sum P_i(t))$ [kW]. |
 | `restored_feeder_kw` | `run_mpc_charging_loop` | **[DERIVED]** | Safe mode synthesized feeder load estimate used when meter is distrusted [kW]. |
 
+### Schedule Dispatch Hardening & Unconditional Validation
+Before any charging schedule is dispatched to physical chargers, every solver output—including solutions marked `OPTIMAL` and `OPTIMAL_INACCURATE`—is unconditionally verified by `validate_schedule_constraints()`. The validator enforces:
+1. **Array Shapes and Dimensionality:** Ensures power matrix shape is strictly $(N, T)$ and unmet energy vector is $(N,)$.
+2. **Finite Value Verification:** Rejects solutions containing $\text{NaN}$ or $\pm\infty$.
+3. **Non-Negativity:** Rejects negative charging powers ($P_{i,t} < -0.05\text{ kW}$) and negative unmet energy slacks ($s_i < -0.05\text{ kWh}$).
+4. **Per-Vehicle Constraints:** Confirms charging rate ceilings ($P_{i,t} \le P_i^{\max}$), connection window compliance ($P_{i,t} = 0$ outside dwell), energy delivery ceiling ($\sum P_{i,t}\Delta t \le E_i^{\text{req}}$), and energy balance with slack ($\sum P_{i,t}\Delta t + s_i \ge E_i^{\text{target}}$).
+5. **Physical Grid Constraints:** Verifies total feeder load ($P_{\text{base}}(t) + \sum P_i(t) \le P_{\text{transformer}}^{\max}$) and independent aggregate cluster caps.
+If any validation check fails, the candidate solution is rejected, an error is recorded, and the system dispatches a fail-safe fallback schedule ($0.0\text{ kW}$ to all vehicles).
+
+### Overload Evaluation Tolerance Band (0.5 kW)
+In grid analytics and telemetry processing, measurement noise from current transformers and energy meters ($\sigma \approx 0.3\text{ kW}$) introduces small zero-mean stochastic fluctuations around rated equipment boundaries. To prevent false overload alarms caused purely by sensor noise when the feeder is operating exactly at capacity ($120.0\text{ kW}$), `compute_overload_minutes` applies a configurable $0.5\text{ kW}$ tolerance band ($\approx 1.67\sigma$):
+$$\text{Overload}(t) = \mathbb{I}\left(P_{\text{feeder}}(t) > P_{\text{feeder}}^{\max} + P_{\text{tolerance}}\right), \quad P_{\text{tolerance}} = 0.5\text{ kW}$$
+Steps where $P_{\text{feeder}} \le 120.5\text{ kW}$ are therefore attributed to sensor uncertainty rather than physical transformer overheating.
+
 ### Invariant Enforcement
 Controller and detector logic **never read the simulator directly**. All inputs are acquired strictly via `MeterInterface` and `EVSEInterface`, guaranteeing that the algorithmic layer operates purely on physical measurements and model forecasts.
 
@@ -182,6 +196,11 @@ Evaluated across 162.5 clean operational day equivalents:
 
 *\*Note on Ramp Recall: Step-level classification recall is 58.3% because early ramp steps ($\Delta < 4.3\text{ kW}$) lie within normal sensor noise; however, episode-level detection is 100% across all 50 seeds well before thermal limits are compromised.*
 
+### Isolation Forest Transient / Change-Detector Limitation
+The Isolation Forest detector extracts a 3-dimensional feature vector: $[r(t), \Delta r(t), r(t)/\sigma]$, where $\Delta r(t) = r(t) - r(t-1)$ captures the derivative of the innovation residual.
+- **Transient vs. State Anomaly Limitation:** Because tree splits heavily weight the abrupt derivative feature $\Delta r(t)$, the model acts primarily as an **abrupt-change / transient detector** rather than a continuous state anomaly monitor.
+- **Failure on Persistent Static Bias:** During an initial step-change attack (or fast ramp), $\Delta r(t)$ is large, producing immediate alarms ($0.0\text{ min}$ latency, $95.8\%$ recall on ramps). However, as a persistent constant bias continues over multiple 15-minute intervals, $\Delta r(t) \to 0$. The model absorbs the steady-state residual into its background density estimation, resulting in a low step-level recall ($12.5\%$) for constant bias attacks. In contrast, the physics-informed CUSUM integrator accumulates residual deviations over time ($S^-(t) = \max(0, S^-(t-1) - r(t) - k)$), maintaining 100% detection recall across the entire attack duration.
+
 ### 5.4 Headline Mitigation Comparison (`results/headline.csv`)
 *Single representative 24-hour trace (`seed=42`) used for publication time-series figure `results/headline.png`:*
 
@@ -201,11 +220,30 @@ $$r(t) = y_{\text{reported}}(t) - \left(P_{\text{base}}^{\text{forecast}}(t) + \
 If an adversary acquires knowledge of the EMS base load forecast $P_{\text{base}}^{\text{forecast}}(t)$ and observes dispatched setpoints $\sum P_i(t)$, they can synthesize telemetry that dynamically satisfies the expected balance:
 $$y_{\text{reported}}(t) = P_{\text{base}}^{\text{forecast}}(t) + \sum_{i} P_i^{\text{cmd}}(t) + \mathcal{N}(0, \sigma^2)$$
 
-**Empirical Result (`experiments/run_adaptive_attacker_limitation.py`):**
-When an unmodeled physical load surge increases actual base demand from $45\text{ kW}$ to $75\text{ kW}$ under an $80\text{ kW}$ transformer limit:
-- True feeder load reaches **$90.00\text{ kW}$** (**$+10.0\text{ kW}$ overload**) for **120.0 minutes**.
+**Demonstrated Empirical Behavior vs. Security Guarantees:**
+The adaptive-attack experiment (`experiments/run_adaptive_attacker_limitation.py`) demonstrates a fundamental **limitation of residual-based change detection**. When an unmodeled physical load surge increases actual base demand from $45\text{ kW}$ to $75\text{ kW}$ under an $80\text{ kW}$ transformer limit:
+- True physical feeder load reaches **$90.00\text{ kW}$** (**$+10.0\text{ kW}$ overload**) for **120.0 minutes**.
 - Innovation residual remains zero-mean noise ($|r(t)| \le 0.5\text{ kW}$).
 - Detector 1 CUSUM raises **0 alarms (100% missed detection rate)**.
+
+**Conditional Protection Claims & Defense Requirements:**
+> [!IMPORTANT]
+> **No Overload Protection by Default:** The system has **NO independent physical overload protection** unless an authoritative independent protective constraint (`max_aggregate_ev_kw`) or a genuine independent out-of-band sensor (`trusted_meter`) is explicitly configured and active.
+> Without one of these active defenses, the system is completely UNPROTECTED against model-cognizant adaptive attacks, and residual-based software detectors (e.g. CUSUM) provide 0 alarms (100% missed detection).
+
+The system supports two independent defense mechanisms:
+1. **Independent Aggregate EV Cap (`max_aggregate_ev_kw`):**
+   $$\sum_{i} P_i(t) \le P_{\text{ev\_max\_aggregate}} = P_{\text{transformer\_limit}} - P_{\text{base\_max\_credible}}$$
+   When this independent constraint ($P_{\text{ev\_max\_aggregate}} = 5.0\text{ kW}$) is active:
+   - True physical feeder load is strictly capped at **$80.00\text{ kW}$** (**$0.0\text{ min}$ overload**), neutralizing the physical impact of the surge even while the software detector is blind.
+   - *Required Assumptions:* Sizing this constraint requires an authoritative physical upper bound on credible non-EV base demand ($P_{\text{base\_max\_credible}}$).
+2. **Out-of-Band Secondary Trusted Meter (`trusted_meter`):**
+   An independent physical sensor measuring total substation active power. In `run_mpc_charging_loop()`, when a trusted meter detects unmodeled load surges ($P_{\text{trusted}} > P_{\text{limit}} - P_{\text{margin}}$ or $|P_{\text{trusted}} - P_{\text{reported}}| > 5.0\text{ kW}$):
+   - Derives actual non-EV base load: $P_{\text{base\_trusted}} = \max(0, P_{\text{trusted}} - \sum P_{\text{ev}}^{\text{meas}})$.
+   - Dynamically clamps available headroom: $\text{Headroom}_{\text{conservative}} = \max(0, P_{\text{limit\_safe}} - P_{\text{base\_trusted}})$.
+   - Updates remaining base forecast using the trusted reading, preventing phantom headroom and eliminating transformer overloads ($0.0\text{ min}$ overload).
+   - *MeterInterface Freshness Contract & Fail-Safe Fallback:* Readings are validated via `MeterInterface.is_reading_fresh(t_min, max_age_s)` using sample timestamps (`get_reading_timestamp_s()`). If sample age exceeds 15 minutes, if timestamps are missing, or if readings are invalid (`NaN`, negative, non-finite, or exceptions), freshness cannot be established. The system safely engages the zero-charging fallback ($0.0\text{ kW}$) or an independent aggregate cap, and reports `is_protection_active=False` rather than falsely attributing protection.
+   - *Required Assumptions:* The secondary telemetry channel must be physically isolated or cryptographically segregated from the primary metering compromise domain.
 
 ### 6.2 Active Power vs. Distribution Grid Physics
 - **Active Power Simplification:** Feeder limits are modeled strictly via active power ($P$ in kW). In actual distribution feeders with high resistance-to-reactance ratios ($R/X \ge 2$), active power injections create localized voltage drops ($V < 0.95\text{ p.u.}$) and phase unbalance before transformer thermal ampacity is reached. Future extensions require Second-Order Cone Programming (SOCP) for branch power flow.
@@ -224,4 +262,61 @@ When transitioning from the software simulator to physical hardware deployment (
 ## 7. Hardware Deployment Roadmap & CAN Bus Security
 
 - **Physical Metering & EVSE Interfaces:** Detailed hardware transition guide in [`docs/hardware_path.md`](docs/hardware_path.md) (Microchip ATM90E26 SPI / TI INA219 I2C drivers and OCPP 1.6-J JSON over WebSockets).
-- **Vehicle-to-Charger CAN Security:** Independent CAN bus intrusion detection module in [`can_security/`](can_security/) evaluating timing anomalies ($\Delta t \ne 100\text{ ms}$) and physical payload range violations.
+- **Vehicle-to-Charger CAN Security Module:** Dedicated CAN bus intrusion detection module in [`can_security/`](can_security/).
+  - **Demonstration vs. Hardened CAN Profiles:**
+    - *Demonstration Profile (CAN 2.0, 8 bytes):* Simulated custom protocol with standard 11-bit CAN ID `0x101`. Because physical telemetry consumes 6 of the 8 bytes, only 2 bytes remain for security (1-byte counter + 1-byte truncated HMAC tag). A 1-byte tag provides only 256 unique states ($2^{-8}$ collision probability), which is mathematically insufficient for production automotive security. Does **NOT** conform to ISO 15118 (PLC / IPv6 / EXI), DIN 70121, or SAE J1939 (29-bit IDs).
+    - *Hardened Simulation Profile (CAN FD, 16 bytes):* Simulated project-specific profile inspired by SecOC principles (ISO 21434 / AUTOSAR), but does NOT implement or claim compliance with an official interoperable AUTOSAR SecOC standard. Uses CAN FD framing (`is_fd=True`) with a 16-byte payload layout carrying physical telemetry, 16-bit sequence counter (0–65535), and an 8-byte (64-bit) truncated HMAC-SHA256 authentication tag ($2^{-64}$ collision resistance).
+    - *Insecure Protocol Fallback Prohibition & Mandatory State File:* When `production_mode=True`, the detector requires an authentication key of at least 16 bytes (128 bits), strictly rejects any standard 8-byte frame or 1-byte MAC with `alarm_type="insecure_protocol_fallback"` (failing safely to 0.0 A), and strictly requires a durable `state_file` to fail closed if persistence is missing or corrupt.
+  - **Replay Protection & Monotonic Freshness Architecture:**
+    - Incorporates receiver session/boot epoch into HMAC computation. Replay protection across detector process restarts assumes authenticated out-of-band epoch synchronization between transmitter and receiver (e.g. ISO 15118 TLS session establishment or SecOC Sync Message broadcast).
+    - When `state_file` is provided (mandatory in `production_mode=True`), the receiver persists and monotonically increments the boot epoch across process lifecycles and `reset()`, ensuring that captured frames from previous executions are rejected upon replay. If the state file is missing or corrupted, production mode fails closed (`FileNotFoundError`, `RuntimeError`) rather than falling back to default epochs.
+    - *Rollback and Concurrency Protection:* File operations are serialized using POSIX advisory locks (`fcntl.flock`) and strict monotonic checks, preventing concurrent startup races or epoch rollbacks on the local filesystem. (Full physical anti-rollback in vehicles requires hardware monotonic counters in an HSM, TPM, or secure element).
+  - **State Corruption Prevention & Robust Freshness:**
+    - Rejected frames (timing bursts, invalid MACs, freshness violations, non-finite or backward timestamps, or out-of-range physical payloads) **never mutate internal timing or counter state** (`last_msg_timestamp` and `last_counter`), preventing attackers from desynchronizing the legitimate stream.
+    - Timestamp validation rejects `NaN`, `+inf`, `-inf`, negative, and backward timestamps without mutating state.
+    - Accurately distinguishes legitimate packet loss ($\le 16$ dropped frames) and 8-bit counter wraparound ($255 \to 0$) from repeated frames ($\Delta c = 0$) and out-of-order frames ($\Delta c > 16$).
+  - **Selective Arbitration Filtering & Malformed Frame Rejection:**
+    - Broadcast CAN bus isolation: ignores unrelated 29-bit extended frames or remote (RTR) frames from other ECUs (`arbitration_id != CAN_ID_BMS_STATUS`) without false-alarming or actuating the target EVSE fail-safe.
+    - Explicitly rejects Remote Transmission Request (RTR) frames, Error frames, extended 29-bit CAN IDs, and invalid payload lengths for the BMS status message.
+  - **Dual Fail-Safe Modes & Explicit Actuation Status:**
+    - Advisory Mode (`evse=None`): Returns diagnostic `CANAnomalyAlert` with recommended `safe_current_setpoint_a = 0.0 A` and `actuation_status="not_connected"`.
+    - Autonomous Actuation Mode (`evse=EVSEInterface`): Catches hardware dispatch exceptions on `set_setpoint_kw()`, reads back submeter power via `read_session_kw()`, and reports explicit `actuation_status` (`"confirmed_zero"`, `"unverified"`, or `"failed"`) alongside `readback_power_kw`.
+
+---
+
+## 8. Embedded C99 Core & Pure Classical Control Architecture
+
+The project incorporates a production-grade **pure embedded C99 core** (`core_c/`) and classical control algorithms, eliminating black-box Machine Learning dependencies (`scikit-learn`) in favor of mathematically bounded, deterministic, and verifiable systems.
+
+```
+core_c/
+├── CMakeLists.txt              # Cross-platform / embedded CMake build
+├── Makefile                    # ANSI C99 compilation to static/shared library & test runner
+├── include/
+│   ├── cusum.h                 # Classical CUSUM sequential change-point detector
+│   ├── kalman_chisq.h          # Kalman filter state estimator & Chi-Square detector
+│   ├── sec_charge_types.h      # MISRA-C compliant data types (zero heap)
+│   ├── secoc.h                 # AUTOSAR SecOC CAN FD authentication & freshness
+│   └── water_filling_scheduler.h # Deterministic O(N) priority water-filling scheduler
+├── src/
+│   ├── cusum.c                 # CUSUM implementation
+│   ├── kalman_chisq.c          # Kalman filter & Chi-Square implementation
+│   ├── secoc.c                 # Standalone SHA-256 / HMAC-SHA256 & SecOC framing
+│   └── water_filling_scheduler.c # Zero-heap water-filling scheduler implementation
+└── tests/
+    └── test_runner.c           # 107/107 unit tests verifying zero-heap math and anti-replay
+```
+
+### 8.1 Key Embedded Capabilities
+1. **Classical Control Anomaly Detection:**
+   - **CUSUM Detector:** Sequential test on power innovation residual $r(t) = P_{\text{expected}}(t) - P_{\text{reported}}(t)$.
+   - **Kalman Filter & Chi-Square ($\chi^2$) Detector:** Discrete-time linear state observer tracking active feeder load dynamics and testing innovation residual variance $d^2 = \frac{\nu_k^2}{S_k}$ against a $\chi^2$ threshold.
+2. **Deterministic $O(N)$ Water-Filling Scheduler:**
+   - Solves EV load balancing within available feeder headroom ($P_{\text{limit}} - P_{\text{base}} - P_{\text{margin}}$) without iterative nonlinear solvers.
+   - Allocates power based on session urgency weights $w_i = \frac{E_{\text{rem}, i}}{\max(\Delta t, T_{\text{dwell}, i})}$.
+   - Guarantees zero heap allocation (`malloc`-free) and deterministic execution in $<10\ \mu\text{s}$ on ARM Cortex-M4/M7.
+3. **AUTOSAR SecOC CAN FD Frame Authentication:**
+   - Bundled self-contained HMAC-SHA256 engine with zero external libraries.
+   - Enforces 32-bit boot/session epochs, 32-bit monotonic message counters, and 64-bit truncated MAC verification with constant-time memory comparisons.
+4. **Python `ctypes` Bridge (`ev_sched.c_bridge`):**
+   - Seamlessly loads `libseccharge.dylib` / `libseccharge.so`, allowing high-level simulation scripts to execute the native C firmware algorithms directly.

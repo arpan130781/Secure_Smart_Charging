@@ -89,7 +89,7 @@ def run_headline_simulation(
         feeder = Feeder(transformer_limit_kw=feeder_limit_kw, base_load_profile_kw=list(base_load))
         rng_sim = np.random.default_rng(seed + 200)
         sim = ChargingStationSimulator(feeder=feeder, sessions=curr_sessions, time_step_min=time_step_min, rng=rng_sim)
-        raw_meter = SimMeter(sim, noise_std_kw=0.3)
+        raw_meter = SimMeter(sim, noise_std_kw=0.3, rng=np.random.default_rng(seed + 300))
         evse = SimEVSE(sim)
 
         if cond == "normal":
@@ -139,21 +139,67 @@ def run_headline_simulation(
             mpc_res.total_ev_power_kw, tariff, time_step_min=time_step_min
         )
         unmet_kwh = compute_unmet_energy_kwh(curr_sessions)
+        delivered_kwh = float(sum(s.delivered_energy_kwh for s in curr_sessions))
+        cost_per_kwh = float(cost_usd / delivered_kwh) if delivered_kwh > 0 else float("nan")
 
         summary_metrics[cond] = {
             "peak_true_load_kw": round(peak_load, 2),
             "overload_minutes": round(overload_min, 1),
             "total_cost_usd": round(cost_usd, 2),
             "unmet_energy_kwh": round(unmet_kwh, 2),
+            "total_delivered_energy_kwh": round(delivered_kwh, 2),
+            "cost_per_delivered_kwh_usd": round(cost_per_kwh, 4),
         }
 
     return time_series_data, summary_metrics
+
+
+def run_headline_multiseed_experiment(
+    config_path: Path,
+    num_seeds: int = 20,
+    num_steps: int = 96,
+    time_step_min: int = 15,
+) -> dict[str, dict[str, float]]:
+    """Execute headline simulation across 20+ seeds and return mean and std of all metrics."""
+    seeds = [42 + i for i in range(num_seeds)]
+    metrics_by_cond: dict[str, dict[str, list[float]]] = {
+        cond: {
+            "peak_true_load_kw": [],
+            "overload_minutes": [],
+            "total_cost_usd": [],
+            "unmet_energy_kwh": [],
+            "total_delivered_energy_kwh": [],
+            "cost_per_delivered_kwh_usd": [],
+        }
+        for cond in ["normal", "under_attack", "under_attack_with_detection"]
+    }
+
+    for seed in seeds:
+        _, single_metrics = run_headline_simulation(
+            config_path=config_path,
+            seed=seed,
+            num_steps=num_steps,
+            time_step_min=time_step_min,
+        )
+        for cond, metrics_dict in metrics_by_cond.items():
+            for k in metrics_dict:
+                metrics_dict[k].append(single_metrics[cond][k])
+
+    summary: dict[str, dict[str, float]] = {}
+    for cond, data in metrics_by_cond.items():
+        summary[cond] = {}
+        for k, values in data.items():
+            summary[cond][f"{k}_mean"] = round(float(np.mean(values)), 2 if "cost_per" not in k else 4)
+            summary[cond][f"{k}_std"] = round(float(np.std(values)), 2 if "cost_per" not in k else 4)
+
+    return summary
 
 
 def plot_headline_figure(
     time_series_data: dict[str, list[float]],
     transformer_limit_kw: float,
     output_png_path: Path,
+    safe_margin_kw: float = 10.0,
     time_step_min: int = 15,
 ) -> None:
     """Generate 3-curve / 3-panel publication figure in plain matplotlib style."""
@@ -177,7 +223,7 @@ def plot_headline_figure(
     ax1.axvspan(9.0, 16.0, color="#ffcccc", alpha=0.4, label="FDI Attack Window (-35 kW)")
     ax1.plot(hours, time_series_data["under_attack"], color="#d62728", linewidth=1.8, label="True Feeder Load [kW] (Corrupted)")
     ax1.axhline(transformer_limit_kw, color="black", linestyle="--", linewidth=1.2, label=f"Transformer Limit ({transformer_limit_kw:.0f} kW)")
-    # Highlight overload area above 120 kW
+    # Highlight overload area above transformer limit
     y_over = np.maximum(transformer_limit_kw, np.array(time_series_data["under_attack"]))
     ax1.fill_between(hours, transformer_limit_kw, y_over, color="#d62728", alpha=0.3, label="Transformer Overload [kW]")
     ax1.set_title("(b) Under Attack (Unmitigated FDI: -35 kW under-reporting)", fontsize=11, fontweight="bold")
@@ -187,10 +233,11 @@ def plot_headline_figure(
 
     # Panel 3: Under Attack with Detection (Mitigated)
     ax2 = axes[2]
+    safe_limit_kw = max(0.0, transformer_limit_kw - safe_margin_kw)
     ax2.axvspan(9.0, 16.0, color="#e6f2ff", alpha=0.4, label="FDI Attack Window (-35 kW)")
     ax2.plot(hours, time_series_data["under_attack_with_detection"], color="#2ca02c", linewidth=1.8, label="True Feeder Load [kW] (Mitigated)")
     ax2.axhline(transformer_limit_kw, color="black", linestyle="--", linewidth=1.2, label=f"Transformer Limit ({transformer_limit_kw:.0f} kW)")
-    ax2.axhline(transformer_limit_kw - 10.0, color="#2ca02c", linestyle=":", linewidth=1.2, label="Safe Mode Headroom (110 kW)")
+    ax2.axhline(safe_limit_kw, color="#2ca02c", linestyle=":", linewidth=1.2, label=f"Safe Mode Headroom ({safe_limit_kw:.0f} kW)")
     ax2.set_title("(c) Under Attack with Detection & Safe Mode (Mitigated)", fontsize=11, fontweight="bold")
     ax2.set_xlabel("Time of Day [Hours]", fontsize=10)
     ax2.set_ylabel("Power [kW]", fontsize=10)
@@ -230,9 +277,19 @@ def main() -> None:
             ])
     print(f"Saved headline metrics table to: {csv_path}")
 
-    # Plot results/headline.png
+    # Plot results/headline.png with configured limits
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+    feeder_limit_kw = float(config["feeder"]["transformer_limit_kw"])
+    safe_margin_kw = float(config.get("mpc", {}).get("conservative_margin_kw", 10.0))
+
     png_path = results_dir / "headline.png"
-    plot_headline_figure(time_series, transformer_limit_kw=120.0, output_png_path=png_path)
+    plot_headline_figure(
+        time_series,
+        transformer_limit_kw=feeder_limit_kw,
+        safe_margin_kw=safe_margin_kw,
+        output_png_path=png_path,
+    )
 
     print("\n" + "=" * 80)
     print("TASK 16: HEADLINE EVALUATION SUMMARY TABLE")

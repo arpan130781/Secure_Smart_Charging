@@ -7,12 +7,13 @@ Includes:
   upon arrival until its requested energy is delivered or it departs.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 
-from ev_sched.models import EVSession, Feeder
+from ev_sched.models import EVSession, Feeder, resolve_session_ids
 
 
 @dataclass
@@ -182,7 +183,8 @@ def run_uncontrolled_charging(
     total_feeder_kw: list[float] = []
     overload_kw: list[float] = []
 
-    # Reset delivered energy on all sessions
+    # Ensure unique, non-empty session IDs and reset delivered energy on all sessions
+    resolve_session_ids(sessions)
     for s in sessions:
         s.delivered_energy_kwh = 0.0
 
@@ -204,12 +206,15 @@ def run_uncontrolled_charging(
         # Calculate uncontrolled charging power across all sessions
         step_ev_power_kw = 0.0
         for s in sessions:
-            if s.is_connected(t_min):
+            overlap_min = s.overlap_minutes(t_min, t_min + time_step_min)
+            if overlap_min > 0.0:
                 rem_kwh = s.remaining_energy_req_kwh
                 if rem_kwh > 1e-4:
-                    # Max power this step bounded by remaining energy headroom
+                    # Max power this step bounded by fractional dwell and remaining energy headroom
+                    frac = overlap_min / float(time_step_min)
+                    effective_max_rate = s.max_rate_kw * frac
                     max_possible_kw = rem_kwh / dt_hours
-                    power_kw = min(s.max_rate_kw, max_possible_kw)
+                    power_kw = min(effective_max_rate, max_possible_kw)
                     energy_delivered_step = power_kw * dt_hours
                     s.delivered_energy_kwh += energy_delivered_step
                     step_ev_power_kw += power_kw
@@ -256,7 +261,8 @@ class ChargingStationSimulator:
         rng: np.random.Generator | None = None,
     ) -> None:
         self.feeder = feeder
-        self.sessions = {s.session_id if s.session_id else f"EV_{i}": s for i, s in enumerate(sessions)}
+        resolve_session_ids(sessions)
+        self.sessions = {s.session_id: s for s in sessions}
         self.time_step_min = time_step_min
         self.rng = rng if rng is not None else np.random.default_rng(42)
         self.current_time_min: int = 0
@@ -272,15 +278,20 @@ class ChargingStationSimulator:
         if ev_id not in self.sessions:
             return 0.0
         session = self.sessions[ev_id]
-        if not session.is_connected(self.current_time_min):
+        step_start = self.current_time_min
+        step_end = step_start + self.time_step_min
+        overlap_min = session.overlap_minutes(step_start, step_end)
+        if overlap_min <= 0.0:
             return 0.0
         if session.remaining_energy_req_kwh <= 1e-4:
             return 0.0
 
         cmd_kw = self.setpoints_kw.get(ev_id, 0.0)
+        frac = overlap_min / float(self.time_step_min)
+        effective_max_rate_kw = session.max_rate_kw * frac
         dt_hours = self.time_step_min / 60.0
         max_energy_kw = session.remaining_energy_req_kwh / dt_hours
-        return float(min(cmd_kw, session.max_rate_kw, max_energy_kw))
+        return float(min(cmd_kw, effective_max_rate_kw, max_energy_kw))
 
     def get_total_ev_power_kw(self) -> float:
         """[SIMULATED] Calculate sum of active power across all charging sessions."""
@@ -302,6 +313,13 @@ class ChargingStationSimulator:
         ev_kw = self.get_total_ev_power_kw()
         return base_kw + ev_kw
 
+    def reset(self) -> None:
+        """[SIMULATED] Reset simulation clock, delivered energies, and active setpoints."""
+        self.current_time_min = 0
+        for session in self.sessions.values():
+            session.delivered_energy_kwh = 0.0
+        self.setpoints_kw = {sid: 0.0 for sid in self.sessions}
+
     def step(self) -> None:
         """[SIMULATED] Integrate physical battery energies and advance time by one interval."""
         dt_hours = self.time_step_min / 60.0
@@ -312,3 +330,59 @@ class ChargingStationSimulator:
                 session.delivered_energy_kwh += energy_added
 
         self.current_time_min += self.time_step_min
+
+
+def generate_base_forecast_with_ar1_error(
+    true_base_load_kw: list[float] | tuple[float, ...],
+    rho: float = 0.9,
+    std_kw: float = 3.0,
+    rng: np.random.Generator | None = None,
+) -> list[float]:
+    """Generate controller base load forecast by adding stationary AR(1) error to true base load.
+
+    e_0 ~ N(0, std_kw^2)
+    e_t = rho * e_{t-1} + sqrt(1 - rho^2) * w_t, where w_t ~ N(0, std_kw^2)
+    forecast_kw[t] = max(0.0, true_base_load_kw[t] + e_t)
+
+    Parameters
+    ----------
+    true_base_load_kw : Sequence[float]
+        Ground-truth physical base load profile in kilowatts [kW].
+    rho : float, default 0.9
+        Lag-1 autocorrelation coefficient (0.0 <= rho < 1.0).
+    std_kw : float, default 3.0
+        Marginal stationary standard deviation of forecast error in kilowatts [kW].
+    rng : Optional[np.random.Generator], default None
+        Random number generator.
+
+    Returns
+    -------
+    List[float]
+        Controller base load forecast with AR(1) forecast error in kilowatts [kW].
+    """
+    if not math.isfinite(rho):
+        raise ValueError(f"rho must be a finite number, got {rho}")
+    if not (0.0 <= rho < 1.0):
+        raise ValueError(f"rho must satisfy 0 <= rho < 1, got {rho}")
+    if not math.isfinite(std_kw):
+        raise ValueError(f"std_kw must be a finite number, got {std_kw}")
+    if std_kw < 0.0:
+        raise ValueError(f"std_kw must be >= 0, got {std_kw}")
+    if std_kw == 0.0:
+        return [float(b) for b in true_base_load_kw]
+
+    generator = rng if rng is not None else np.random.default_rng(42)
+    n = len(true_base_load_kw)
+    if n == 0:
+        return []
+
+    innov_scale = float(std_kw * np.sqrt(max(0.0, 1.0 - rho**2)))
+    errors = np.zeros(n, dtype=float)
+    errors[0] = float(generator.normal(0.0, std_kw))
+
+    for t in range(1, n):
+        innov = float(generator.normal(0.0, innov_scale))
+        errors[t] = rho * errors[t - 1] + innov
+
+    forecast = [float(max(0.0, true_base_load_kw[t] + errors[t])) for t in range(n)]
+    return forecast

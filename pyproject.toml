@@ -5,14 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ev_sched"
 version = "0.1.0"
-description = "Secure smart EV charging: MPC scheduling, False Data Injection resilience, and lightweight bad-data detection."
+description = "Secure smart EV charging: Embedded C99 core, deterministic water-filling scheduling, False Data Injection resilience, and classical CUSUM/Kalman bad-data detection."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=2.0.0",
     "scipy>=1.14.0",
     "cvxpy>=1.4.0",
-    "scikit-learn>=1.5.0",
     "matplotlib>=3.9.0",
     "pyyaml>=6.0",
     "python-can>=4.3.0"

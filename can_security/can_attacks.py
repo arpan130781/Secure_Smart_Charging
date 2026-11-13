@@ -54,3 +54,29 @@ def inject_replay_attack(
         current_time += burst_period_s
 
     return replayed_msgs
+
+
+def inject_nominal_timing_replay_attack(
+    recorded_buffer: list[can.Message],
+    replay_start_time: float,
+    period_s: float = 0.100,
+) -> list[can.Message]:
+    """Replay captured CAN frames using nominal timing (100 ms) to evade timing-only IDS.
+
+    Adversary replays historical frames with perfectly valid periodicity, requiring
+    authenticated freshness protection (sequence counter / MAC) to detect.
+    """
+    replayed_msgs: list[can.Message] = []
+    current_time = replay_start_time
+
+    for msg in recorded_buffer:
+        replayed_frame = can.Message(
+            arbitration_id=msg.arbitration_id,
+            data=bytes(msg.data),
+            is_extended_id=msg.is_extended_id,
+            timestamp=current_time,
+        )
+        replayed_msgs.append(replayed_frame)
+        current_time += period_s
+
+    return replayed_msgs

@@ -20,6 +20,7 @@ from can_security.can_attacks import (
     inject_value_tampering,
 )
 from can_security.can_detector import CANSecurityDetector
+from ev_sched.hal import EVSEInterface
 
 
 def test_encode_and_decode_bms_status() -> None:
@@ -147,3 +148,83 @@ def test_python_can_virtual_bus_integration() -> None:
 
     bus_tx.shutdown()
     bus_rx.shutdown()
+
+
+class MockReadbackEVSE(EVSEInterface):
+    def __init__(self, readback_value: float | Exception) -> None:
+        self.readback_value = readback_value
+        self.dispatched_setpoint: float | None = None
+
+    def set_setpoint_kw(self, ev_id: str, power_kw: float) -> None:
+        self.dispatched_setpoint = power_kw
+
+    def read_session_kw(self, ev_id: str) -> float:
+        if isinstance(self.readback_value, Exception):
+            raise self.readback_value
+        return self.readback_value
+
+
+class MockFailingSetpointEVSE(EVSEInterface):
+    def __init__(self, exc: Exception) -> None:
+        self.exc = exc
+
+    def set_setpoint_kw(self, ev_id: str, power_kw: float) -> None:
+        raise self.exc
+
+    def read_session_kw(self, ev_id: str) -> float:
+        return 0.0
+
+
+def test_can_detector_failsafe_rejects_nan_and_infinite_readback() -> None:
+    """EVSE readback of NaN or inf must never produce actuation_status='confirmed_zero'."""
+    anomalous_msg = can.Message(
+        arbitration_id=CAN_ID_BMS_STATUS,
+        data=b"\x00" * 4,  # Malformed DLC
+        is_extended_id=False,
+        timestamp=1.0,
+    )
+
+    # 1. NaN readback must result in 'unverified', never 'confirmed_zero'
+    evse_nan = MockReadbackEVSE(float("nan"))
+    det_nan = CANSecurityDetector(evse=evse_nan, ev_id="EV_NAN")
+    alert_nan = det_nan.evaluate_message(anomalous_msg)
+    assert alert_nan.is_alarm is True
+    assert alert_nan.actuation_status != "confirmed_zero"
+    assert alert_nan.actuation_status == "unverified"
+
+    # 2. Positive infinity readback must result in 'unverified'
+    evse_inf = MockReadbackEVSE(float("inf"))
+    det_inf = CANSecurityDetector(evse=evse_inf, ev_id="EV_INF")
+    alert_inf = det_inf.evaluate_message(anomalous_msg)
+    assert alert_inf.is_alarm is True
+    assert alert_inf.actuation_status != "confirmed_zero"
+    assert alert_inf.actuation_status == "unverified"
+
+    # 3. Negative infinity readback must result in 'unverified'
+    evse_neginf = MockReadbackEVSE(float("-inf"))
+    det_neginf = CANSecurityDetector(evse=evse_neginf, ev_id="EV_NEGINF")
+    alert_neginf = det_neginf.evaluate_message(anomalous_msg)
+    assert alert_neginf.is_alarm is True
+    assert alert_neginf.actuation_status != "confirmed_zero"
+    assert alert_neginf.actuation_status == "unverified"
+
+    # 4. Readback query exception must result in 'failed'
+    evse_err = MockReadbackEVSE(RuntimeError("I2C read failure"))
+    det_err = CANSecurityDetector(evse=evse_err, ev_id="EV_ERR")
+    alert_err = det_err.evaluate_message(anomalous_msg)
+    assert alert_err.is_alarm is True
+    assert alert_err.actuation_status == "failed"
+
+    # 5. Setpoint dispatch exception must result in 'failed'
+    evse_cmd_err = MockFailingSetpointEVSE(RuntimeError("CAN command bus dropped"))
+    det_cmd_err = CANSecurityDetector(evse=evse_cmd_err, ev_id="EV_CMD_ERR")
+    alert_cmd_err = det_cmd_err.evaluate_message(anomalous_msg)
+    assert alert_cmd_err.is_alarm is True
+    assert alert_cmd_err.actuation_status == "failed"
+
+    # 6. Finite zero readback within tolerance results in 'confirmed_zero'
+    evse_zero = MockReadbackEVSE(0.0)
+    det_zero = CANSecurityDetector(evse=evse_zero, ev_id="EV_ZERO")
+    alert_zero = det_zero.evaluate_message(anomalous_msg)
+    assert alert_zero.is_alarm is True
+    assert alert_zero.actuation_status == "confirmed_zero"

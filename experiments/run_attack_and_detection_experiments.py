@@ -13,17 +13,18 @@ Evaluates:
 
 import csv
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 
+import ev_sched.scheduler as sched
 from ev_sched.attacks import create_attacked_meter
-from ev_sched.detector import CUSUMDetector, IsolationForestDetector
+from ev_sched.detector import CUSUMDetector, DetectorAlert, IsolationForestDetector
 from ev_sched.hal import SimEVSE, SimMeter
 from ev_sched.metrics import compute_run_metrics
 from ev_sched.models import EVSession, Feeder, Tariff
-from ev_sched.scheduler import solve_charging_schedule
 from ev_sched.simulator import (
     ChargingStationSimulator,
     generate_synthetic_sessions,
@@ -32,21 +33,47 @@ from experiments.compare_baseline_vs_mpc import create_tou_tariff
 from experiments.run_baseline import generate_diurnal_base_load
 
 
+class MonitoringDetector:
+    """Composite detector updating CUSUM and IsolationForest while running MPC."""
+
+    def __init__(self, cusum: CUSUMDetector, iso: IsolationForestDetector, passive: bool = True) -> None:
+        self.cusum = cusum
+        self.iso = iso
+        self.passive = passive
+        self.cusum_alarms: list[bool] = []
+        self.iso_alarms: list[bool] = []
+
+    def update(self, reported_feeder_kw: float, expected_feeder_kw: float) -> DetectorAlert:
+        c_alert = self.cusum.update(reported_feeder_kw=reported_feeder_kw, expected_feeder_kw=expected_feeder_kw)
+        i_alert = self.iso.update(reported_feeder_kw=reported_feeder_kw, expected_feeder_kw=expected_feeder_kw)
+        self.cusum_alarms.append(bool(c_alert.is_alarm))
+        self.iso_alarms.append(bool(i_alert.is_alarm))
+        if self.passive:
+            # Under unmitigated attack evaluation, do not trigger safe mode
+            return DetectorAlert(
+                is_alarm=False,
+                residual_kw=c_alert.residual_kw,
+                statistic_value=c_alert.statistic_value,
+            )
+        return c_alert
+
+
 def train_isolation_forest_on_clean_runs(
     config: dict,
     feeder_limit_kw: float,
     tariff: Tariff,
     num_train_seeds: int = 5,
+    num_steps: int = 96,
 ) -> IsolationForestDetector:
-    """Train Isolation Forest on attack-free operational telemetry."""
-    print("Training Isolation Forest Detector on attack-free baseline runs...")
+    """Train Isolation Forest on attack-free operational telemetry with real MPC charging."""
+    print("Training Isolation Forest Detector on attack-free baseline runs with active MPC...")
     detector = IsolationForestDetector(contamination=0.01, random_state=42)
     feature_rows: list[np.ndarray] = []
 
     for seed in range(500, 500 + num_train_seeds):
         rng = np.random.default_rng(seed)
         base_load = generate_diurnal_base_load(
-            num_steps=96,
+            num_steps=num_steps,
             nominal_kw=config["feeder"]["nominal_base_kw"],
             peak_kw=config["feeder"]["peak_base_kw"],
             valley_kw=config["feeder"]["valley_base_kw"],
@@ -55,19 +82,31 @@ def train_isolation_forest_on_clean_runs(
         feeder = Feeder(transformer_limit_kw=feeder_limit_kw, base_load_profile_kw=base_load)
         sessions = generate_synthetic_sessions(config, rng)
         sim = ChargingStationSimulator(feeder, sessions, time_step_min=15, rng=rng)
-        meter = SimMeter(sim, noise_std_kw=0.3)
+        meter_rng = np.random.default_rng(seed + 1000)
+        meter = SimMeter(sim, noise_std_kw=0.3, rng=meter_rng)
         evse = SimEVSE(sim)
 
+        # Run real MPC loop so training features see genuine dispatched EV charging load
+        res = sched.run_mpc_charging_loop(
+            feeder=feeder,
+            sessions=sessions,
+            tariff=tariff,
+            meter=meter,
+            evse=evse,
+            simulator=sim,
+            time_step_min=15,
+            num_steps=num_steps,
+            horizon_steps=16,
+            detector=None,
+        )
+
         prev_r = 0.0
-        for step in range(96):
-            t_min = step * 15
-            meas_kw = meter.read_feeder_kw(t_min)
-            cmd_kw_total = sum(evse.read_session_kw(s.session_id) for s in sessions)
-            expected_kw = base_load[step] + cmd_kw_total
+        for step in range(num_steps):
+            meas_kw = res.measured_feeder_kw[step]
+            expected_kw = res.base_load_kw[step] + res.total_ev_power_kw[step]
             feat = detector.extract_features(meas_kw, expected_kw, prev_residual_kw=prev_r)
             prev_r = float(feat[0])
             feature_rows.append(feat)
-            sim.step()
 
     X_train = np.vstack(feature_rows)
     detector.fit_from_attack_free_runs(X_train)
@@ -86,7 +125,7 @@ def run_mpc_with_monitoring(
     num_steps: int = 96,
     horizon_steps: int = 16,
 ) -> tuple[list[float], list[float], list[bool], list[bool], list[bool]]:
-    """Run MPC loop under optional attack and monitor with both detectors.
+    """Run MPC loop under optional attack and monitor with both detectors via run_mpc_charging_loop.
 
     Returns
     -------
@@ -98,9 +137,9 @@ def run_mpc_with_monitoring(
     - iso_alarms          : List[bool]
     """
     rng = np.random.default_rng(seed)
-
     sim = ChargingStationSimulator(feeder=feeder, sessions=sessions, time_step_min=time_step_min, rng=rng)
-    base_meter = SimMeter(sim, noise_std_kw=0.3)
+    meter_rng = np.random.default_rng(seed + 5000)
+    base_meter = SimMeter(sim, noise_std_kw=0.3, rng=meter_rng)
     evse = SimEVSE(sim)
 
     # Wrap meter if attack configured
@@ -111,101 +150,73 @@ def run_mpc_with_monitoring(
 
     cusum = CUSUMDetector(threshold=18.0, slack_kw=1.5, instant_threshold_kw=20.0)
     iso_detector.reset()
+    monitor = MonitoringDetector(cusum=cusum, iso=iso_detector, passive=True)
 
-    true_feeder_kw: list[float] = []
-    reported_kw: list[float] = []
-    attack_mask: list[bool] = []
-    cusum_alarms: list[bool] = []
-    iso_alarms: list[bool] = []
+    res = sched.run_mpc_charging_loop(
+        feeder=feeder,
+        sessions=sessions,
+        tariff=tariff,
+        meter=meter,
+        evse=evse,
+        simulator=sim,
+        time_step_min=time_step_min,
+        num_steps=num_steps,
+        horizon_steps=horizon_steps,
+        detector=monitor,
+        use_telemetry_base_tracking=True,
+    )
 
-    base_profile = list(feeder.base_load_profile_kw)
-    price_profile = list(tariff.price_per_kwh_per_15min)
+    attack_mask = [
+        bool(meter.is_attack_active(t)) if hasattr(meter, "is_attack_active") else False
+        for t in res.step_times_min
+    ]
+    return res.true_feeder_kw, res.measured_feeder_kw, attack_mask, monitor.cusum_alarms, monitor.iso_alarms
 
-    for step in range(num_steps):
-        t_min = step * time_step_min
 
-        # Check ground truth attack state
-        is_attack = False
-        if attack_config is not None and hasattr(meter, "is_attack_active"):
-            is_attack = meter.is_attack_active(t_min)
-        attack_mask.append(is_attack)
+def compute_detection_summary_metrics(
+    data: dict[str, Any],
+    total_clean_days: float | None = None,
+) -> dict[str, Any]:
+    """Compute precision (NaN if no alarms), recall, FAR, delay, and episode-level metrics.
 
-        # 1. Read meter via HAL (under attack if active)
-        meas_kw = meter.read_feeder_kw(t_min)
-        reported_kw.append(meas_kw)
+    The clean-day denominator for false alarms per day matches the clean intervals
+    actually evaluated: total_clean_days = sum(y_true == 0) / 96.0.
+    """
+    y_true = np.array(data["y_true"], dtype=int)
+    y_pred = np.array(data["y_pred"], dtype=int)
 
-        curr_base_kw = base_profile[step]
+    tp = int(np.sum((y_true == 1) & (y_pred == 1)))
+    fp = int(np.sum((y_true == 0) & (y_pred == 1)))
+    fn = int(np.sum((y_true == 1) & (y_pred == 0)))
 
-        # In SCADA/EMS systems, background base load is inferred from feeder telemetry:
-        # P_base_inferred = max(0, meas_feeder_kw - ev_submetered_kw).
-        # Under False Data Injection, this offset directly corrupts the scheduler's lookahead headroom!
-        current_ev_measured_kw = sum(evse.read_session_kw(s.session_id) for s in sessions)
-        inferred_current_base = max(0.0, meas_kw - current_ev_measured_kw)
-        telemetry_offset_kw = inferred_current_base - curr_base_kw
+    # Exact clean-interval accounting
+    clean_intervals = int(np.sum(y_true == 0))
+    if total_clean_days is None or total_clean_days <= 0.0:
+        clean_days = float(clean_intervals / 96.0)
+    else:
+        clean_days = float(total_clean_days)
 
-        # 2. Re-solve MPC over remaining horizon using poisoned telemetry offset
-        rem_steps = num_steps - step
-        plan_steps = min(horizon_steps, rem_steps)
-        rem_base = [
-            max(0.0, b + telemetry_offset_kw)
-            for b in base_profile[step : step + plan_steps]
-        ]
-        rem_feeder = Feeder(transformer_limit_kw=feeder.transformer_limit_kw, base_load_profile_kw=rem_base)
-        rem_prices = price_profile[step : step + plan_steps]
-        rem_tariff = Tariff(price_per_kwh_per_15min=rem_prices)
+    precision = float(tp / (tp + fp)) if (tp + fp) > 0 else float("nan")
+    recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+    far_per_day = float(fp / clean_days) if clean_days > 0 else 0.0
 
-        # Construct shifted sessions
-        active_rem_sessions: list[EVSession] = []
-        for s in sessions:
-            arr_rel = max(0, s.arrival_min - t_min)
-            dep_rel = max(1, s.departure_min - t_min)
-            rem_energy = (
-                s.remaining_energy_req_kwh
-                if (s.is_connected(t_min) or (s.arrival_min >= t_min and s.arrival_min < t_min + plan_steps * time_step_min))
-                else 0.0
-            )
-            shifted_s = EVSession(
-                arrival_min=arr_rel,
-                departure_min=dep_rel,
-                energy_req_kwh=rem_energy,
-                max_rate_kw=s.max_rate_kw,
-                session_id=s.session_id,
-            )
-            active_rem_sessions.append(shifted_s)
+    latencies = data.get("latencies", [])
+    mean_delay_min = float(np.mean(latencies)) if latencies else float("nan")
 
-        opt_res = solve_charging_schedule(
-            sessions=active_rem_sessions,
-            feeder=rem_feeder,
-            tariff=rem_tariff,
-            time_step_min=time_step_min,
-            num_steps=plan_steps,
-        )
+    episodes = data.get("episode_outcomes", [])
+    total_episodes = len(episodes)
+    detected_episodes = sum(1 for ep in episodes if ep.get("detected", False))
+    episode_rate = float(detected_episodes / total_episodes) if total_episodes > 0 else 0.0
+    episode_misses = int(total_episodes - detected_episodes)
 
-        # 3. Apply first step setpoints
-        step_ev_cmd = 0.0
-        for i, s in enumerate(sessions):
-            cmd_kw = float(opt_res.power_schedule_kw[i, 0]) if (opt_res.is_success and i < opt_res.power_schedule_kw.shape[0]) else 0.0
-            evse.set_setpoint_kw(s.session_id, cmd_kw)
-            actual_kw = evse.read_session_kw(s.session_id)
-            step_ev_cmd += actual_kw
-
-        # Expected feeder load = base load forecast + aggregate EV power currently commanded/active
-        expected_feeder_kw = curr_base_kw + current_ev_measured_kw
-
-        # 4. Update detectors
-        c_alert = cusum.update(reported_feeder_kw=meas_kw, expected_feeder_kw=expected_feeder_kw)
-        cusum_alarms.append(c_alert.is_alarm)
-
-        i_alert = iso_detector.update(reported_feeder_kw=meas_kw, expected_feeder_kw=expected_feeder_kw)
-        iso_alarms.append(i_alert.is_alarm)
-
-        # Ground truth true feeder power
-        true_feeder_kw.append(sim.get_feeder_power_kw(t_min))
-
-        # Advance simulator
-        sim.step()
-
-    return true_feeder_kw, reported_kw, attack_mask, cusum_alarms, iso_alarms
+    return {
+        "precision": round(precision, 3) if not np.isnan(precision) else float("nan"),
+        "recall": round(recall, 3),
+        "false_alarms_per_day": round(far_per_day, 2),
+        "detection_delay_minutes": round(mean_delay_min, 1) if not np.isnan(mean_delay_min) else "N/A",
+        "episode_detection_rate": round(episode_rate, 3),
+        "episode_misses": episode_misses,
+    }
 
 
 def run_all_experiments(
@@ -252,10 +263,11 @@ def run_all_experiments(
 
     # Detection metrics tracking: { (detector, attack): [ (y_true, y_pred, latency) ] }
     eval_data: dict[tuple[str, str], dict[str, list]] = {
-        (det, atk): {"y_true": [], "y_pred": [], "latencies": []}
+        (det, atk): {"y_true": [], "y_pred": [], "latencies": [], "episode_outcomes": []}
         for det in ["CUSUM", "IsolationForest"]
         for atk in ["constant_bias", "ramp", "replay"]
     }
+    clean_baseline_alerts: dict[int, dict[str, list[bool]]] = {}
 
     # Store sample trajectory for plotting (from seed 200)
     plot_trajectories: dict[str, list[float]] = {}
@@ -309,26 +321,47 @@ def run_all_experiments(
                 "unmet_energy_kwh": round(m.unmet_energy_kwh, 2),
             })
 
+            # Record clean baseline detector telemetry
+            if atk_name == "no_attack":
+                clean_baseline_alerts[seed] = {
+                    "CUSUM": list(cusum_alerts),
+                    "IsolationForest": list(iso_alerts),
+                }
+
             # Record detection metrics if under attack
             if atk_name in ["constant_bias", "ramp", "replay"]:
                 # Detection delay calculation
                 first_atk_step = 480 // 15  # step 32
+                last_atk_step = first_atk_step + (360 // 15)  # step 56
                 c_delay = None
                 i_delay = None
 
-                for step_idx in range(first_atk_step, first_atk_step + (360 // 15)):
-                    if cusum_alerts[step_idx] and c_delay is None:
-                        c_delay = (step_idx - first_atk_step) * 15
-                    if iso_alerts[step_idx] and i_delay is None:
-                        i_delay = (step_idx - first_atk_step) * 15
+                c_detected = False
+                i_detected = False
+                for step_idx in range(first_atk_step, last_atk_step):
+                    if cusum_alerts[step_idx]:
+                        c_detected = True
+                        if c_delay is None:
+                            c_delay = (step_idx - first_atk_step) * 15
+                    if iso_alerts[step_idx]:
+                        i_detected = True
+                        if i_delay is None:
+                            i_delay = (step_idx - first_atk_step) * 15
 
-                eval_data[("CUSUM", atk_name)]["y_true"].extend(attack_mask)
-                eval_data[("CUSUM", atk_name)]["y_pred"].extend(cusum_alerts)
+                eval_data[("CUSUM", atk_name)]["episode_outcomes"].append({"seed": seed, "detected": c_detected})
+                eval_data[("IsolationForest", atk_name)]["episode_outcomes"].append({"seed": seed, "detected": i_detected})
+
+                # Include clean-run baseline intervals alongside the attack run
+                c_clean = clean_baseline_alerts.get(seed, {}).get("CUSUM", [])
+                i_clean = clean_baseline_alerts.get(seed, {}).get("IsolationForest", [])
+
+                eval_data[("CUSUM", atk_name)]["y_true"].extend([False] * len(c_clean) + attack_mask)
+                eval_data[("CUSUM", atk_name)]["y_pred"].extend(c_clean + cusum_alerts)
                 if c_delay is not None:
                     eval_data[("CUSUM", atk_name)]["latencies"].append(c_delay)
 
-                eval_data[("IsolationForest", atk_name)]["y_true"].extend(attack_mask)
-                eval_data[("IsolationForest", atk_name)]["y_pred"].extend(iso_alerts)
+                eval_data[("IsolationForest", atk_name)]["y_true"].extend([False] * len(i_clean) + attack_mask)
+                eval_data[("IsolationForest", atk_name)]["y_pred"].extend(i_clean + iso_alerts)
                 if i_delay is not None:
                     eval_data[("IsolationForest", atk_name)]["latencies"].append(i_delay)
 
@@ -348,32 +381,21 @@ def run_all_experiments(
     # 5. Compute & Export Task 14: results/detection_metrics.csv
     detection_rows: list[dict] = []
     for (det_name, atk_name), data in eval_data.items():
-        y_true = np.array(data["y_true"], dtype=int)
-        y_pred = np.array(data["y_pred"], dtype=int)
-
-        tp = int(np.sum((y_true == 1) & (y_pred == 1)))
-        fp = int(np.sum((y_true == 0) & (y_pred == 1)))
-        fn = int(np.sum((y_true == 1) & (y_pred == 0)))
-
-        precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 1.0
-        recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
-
-        # False alarm rate per day: FP divided by number of normal days evaluated
-        # (Total unattacked steps across 20 runs = 20 * (96 - 24) = 1440 steps = 15 days of clean data)
-        clean_days = float((len(y_true) - np.sum(y_true)) / 96.0)
-        far_per_day = float(fp / clean_days) if clean_days > 0 else 0.0
-
-        latencies = data["latencies"]
-        mean_delay_min = float(np.mean(latencies)) if latencies else float("nan")
-
-        detection_rows.append({
+        row = compute_detection_summary_metrics(data)
+        row["detector"] = det_name
+        row["attack_type"] = atk_name
+        # Reorder so detector and attack_type come first
+        reordered = {
             "detector": det_name,
             "attack_type": atk_name,
-            "precision": round(precision, 3),
-            "recall": round(recall, 3),
-            "false_alarms_per_day": round(far_per_day, 2),
-            "detection_delay_minutes": round(mean_delay_min, 1) if not np.isnan(mean_delay_min) else "N/A",
-        })
+            "precision": row["precision"],
+            "recall": row["recall"],
+            "false_alarms_per_day": row["false_alarms_per_day"],
+            "detection_delay_minutes": row["detection_delay_minutes"],
+            "episode_detection_rate": row["episode_detection_rate"],
+            "episode_misses": row["episode_misses"],
+        }
+        detection_rows.append(reordered)
 
     detection_csv_path = results_dir / "detection_metrics.csv"
     with open(detection_csv_path, mode="w", newline="", encoding="utf-8") as f:

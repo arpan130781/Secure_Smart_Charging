@@ -11,7 +11,49 @@ Distinction:
 - [MEASURED]: Telemetry observed across the hardware abstraction layer (HAL).
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+
+
+def resolve_session_ids(sessions: Sequence["EVSession"]) -> list["EVSession"]:
+    """Ensure every EV session has a unique, non-empty ID before simulation or dispatch.
+
+    Assigns deterministic, unique IDs (e.g. 'EV_01', 'EV_02') to sessions with empty,
+    whitespace, or missing IDs, and disambiguates duplicate IDs with numerical suffixes.
+    Updates the session_id attribute in-place on each session instance.
+
+    Parameters
+    ----------
+    sessions : Sequence[EVSession]
+        List or sequence of EV charging sessions.
+
+    Returns
+    -------
+    list[EVSession]
+        List of sessions guaranteed to possess unique, non-empty session IDs.
+    """
+    used_ids: set[str] = set()
+    for i, s in enumerate(sessions):
+        sid = s.session_id.strip() if (s.session_id and isinstance(s.session_id, str)) else ""
+        if not sid:
+            candidate = f"EV_{i+1:02d}"
+            suffix = 1
+            while candidate in used_ids:
+                candidate = f"EV_{i+1:02d}_{suffix}"
+                suffix += 1
+            s.session_id = candidate
+        elif sid in used_ids:
+            base_id = sid
+            suffix = 1
+            candidate = f"{base_id}_{suffix}"
+            while candidate in used_ids:
+                suffix += 1
+                candidate = f"{base_id}_{suffix}"
+            s.session_id = candidate
+        else:
+            s.session_id = sid
+        used_ids.add(s.session_id)
+    return list(sessions)
 
 
 @dataclass
@@ -70,6 +112,19 @@ class EVSession:
     def is_connected(self, t_min: int) -> bool:
         """Check if vehicle is physically plugged in at elapsed minute t_min."""
         return self.arrival_min <= t_min < self.departure_min
+
+    def overlap_minutes(self, start_min: float, end_min: float) -> float:
+        """Return physical dwell time [minutes] within interval [start_min, end_min)."""
+        if end_min <= start_min:
+            return 0.0
+        return max(0.0, float(min(self.departure_min, end_min) - max(self.arrival_min, start_min)))
+
+    def connection_fraction(self, start_min: float, end_min: float) -> float:
+        """Return fraction of interval [start_min, end_min) that vehicle is plugged in [0.0, 1.0]."""
+        span = float(end_min - start_min)
+        if span <= 0.0:
+            return 0.0
+        return float(self.overlap_minutes(start_min, end_min) / span)
 
 
 @dataclass(frozen=True)
